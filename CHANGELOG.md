@@ -4,6 +4,11 @@ All notable changes to the "vscode-acp" extension will be documented in this fil
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.1.7] - 2026-05-10
+
+### Changed
+- **Claude Code**: Updated default package from `@zed-industries/claude-code-acp` to `@agentclientprotocol/claude-agent-acp` (the package was renamed upstream).
+
 ## [0.1.6] - 2026-04-20
 
 ### Added
