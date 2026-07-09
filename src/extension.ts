@@ -60,6 +60,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // Focus the chat wherever the user prefers it (sidebar view or editor tab).
   const focusChat = () => {
     const location = vscode.workspace.getConfiguration('acp').get<string>('preferredLocation', 'sidebar');
+    log(`focusChat: preferredLocation=${location}`);
     if (location === 'tab') {
       chatWebviewProvider.openAsTab();
     } else {

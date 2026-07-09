@@ -94,6 +94,8 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   private createTab(): void {
+    const bound = this.sessionManager.getActiveSessionId() ?? null;
+    log(`createTab: opening chat tab (bound session: ${bound ?? 'none yet'})`);
     const panel = vscode.window.createWebviewPanel(
       'acp-chat-tab',
       'ACP Chat',
@@ -101,7 +103,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       { retainContextWhenHidden: true, enableScripts: true },
     );
     panel.iconPath = vscode.Uri.joinPath(this.extensionUri, 'resources', 'icon.svg');
-    this.panels.set(panel, this.sessionManager.getActiveSessionId() ?? null);
+    this.panels.set(panel, bound);
     this.attachWebview(panel.webview);
     panel.onDidDispose(() => {
       this.panels.delete(panel);
@@ -134,6 +136,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     webview.onDidReceiveMessage(async (message) => {
       switch (message.type) {
         case 'sendPrompt':
+          log(`webview -> sendPrompt (${(message.text || '').length} chars)`);
           this._hasChatContent = true;
           await this.handleSendPrompt(message.text);
           break;
@@ -150,6 +153,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           await this.handleSetConfigOption(message.configId, message.value);
           break;
         case 'executeCommand':
+          log(`webview -> executeCommand: ${message.command}`);
           if (message.command) {
             await vscode.commands.executeCommand(message.command);
           }
@@ -171,7 +175,11 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           break;
         case 'ready':
           // Webview loaded — send current session state (host-local)
+          log('webview ready (host attached)');
           this.sendCurrentState(webview);
+          break;
+        case 'clientError':
+          log(`WEBVIEW ERROR: ${message.message} (line ${message.line}) ${message.stack || ''}`);
           break;
         case 'renderMarkdown': {
           // Webview requests markdown rendering for history items
@@ -1391,6 +1399,18 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
 
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
+    // Forward any script error to the extension log — webview consoles are
+    // otherwise invisible without devtools.
+    window.addEventListener('error', (e) => {
+      try {
+        vscode.postMessage({ type: 'clientError', message: String(e.message || e), line: e.lineno || 0, stack: e.error && e.error.stack ? String(e.error.stack).slice(0, 600) : '' });
+      } catch (_) { /* ignore */ }
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      try {
+        vscode.postMessage({ type: 'clientError', message: 'unhandledrejection: ' + String(e.reason).slice(0, 300), line: 0, stack: '' });
+      } catch (_) { /* ignore */ }
+    });
     const messagesEl = document.getElementById('messages');
     const emptyState = document.getElementById('emptyState');
     const promptInput = document.getElementById('promptInput');
