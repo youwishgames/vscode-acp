@@ -231,6 +231,31 @@ export function activate(context: vscode.ExtensionContext): void {
     chatWebviewProvider.openAsTab();
   });
 
+  // "+" — start a new conversation in a NEW chat tab (previous tab keeps
+  // its transcript, frozen). Falls back to connect when nothing is active.
+  const newChatTabCmd = vscode.commands.registerCommand('acp.newChatTab', async () => {
+    if (!sessionManager.getActiveSession()) {
+      await vscode.commands.executeCommand('acp.connectAgent');
+      return;
+    }
+    try {
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Starting new conversation...',
+          cancellable: false,
+        },
+        async () => {
+          await sessionManager.newConversation();
+        },
+      );
+      chatWebviewProvider.openNewTab();
+    } catch (e: any) {
+      logError('Failed to open new chat tab', e);
+      vscode.window.showErrorMessage(`Failed to start new chat: ${e.message}`);
+    }
+  });
+
   // Send Prompt (from keybinding — just focus chat)
   const sendPromptCmd = vscode.commands.registerCommand('acp.sendPrompt', async () => {
     focusChat();
@@ -523,6 +548,7 @@ export function activate(context: vscode.ExtensionContext): void {
     disconnectAgentCmd,
     openChatCmd,
     openChatTabCmd,
+    newChatTabCmd,
     sendPromptCmd,
     cancelTurnCmd,
     restartAgentCmd,

@@ -2,7 +2,7 @@
   "name": "acp-client",
   "displayName": "ACP Client (You Wish fork)",
   "description": "Agent Client Protocol client for VS Code \u2014 connect to GitHub Copilot, Claude Code, Gemini CLI, Qwen Code, Codex CLI, OpenCode, OpenClaw, Kiro CLI, Hermes Agent, and any ACP-compatible AI coding agent",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "publisher": "formulahendry",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -161,6 +161,11 @@
       {
         "command": "acp.openChatTab",
         "title": "ACP: Open Chat as Tab"
+      },
+      {
+        "command": "acp.newChatTab",
+        "title": "ACP: New Chat Tab",
+        "icon": "$(add)"
       }
     ],
     "menus": {
@@ -263,6 +268,13 @@
           "command": "acp.forgetSession",
           "when": "view == acp-sessions && viewItem == session-local",
           "group": "session@2"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "acp.newChatTab",
+          "when": "activeWebviewPanelId == acp-chat-tab",
+          "group": "navigation"
         }
       ]
     },

@@ -14,7 +14,9 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'acp-chat';
 
   private view?: vscode.WebviewView;
-  private panel?: vscode.WebviewPanel;
+  // Chat tabs -> the session id each is bound to (null = adopts the next
+  // active session). The sidebar view always follows the active session.
+  private panels = new Map<vscode.WebviewPanel, string | null>();
   private updateListener: SessionUpdateListener;
   private _hasChatContent = false;
 
@@ -69,14 +71,29 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Open (or reveal) the chat as an editor tab hosting the same chat webview.
-   * Both hosts stay live: session updates are broadcast to whichever exist.
+   * Open (or reveal) the chat tab for the CURRENT conversation.
+   * Creates one if none is bound to the active session.
    */
   openAsTab(): void {
-    if (this.panel) {
-      this.panel.reveal();
-      return;
+    const activeId = this.sessionManager.getActiveSessionId() ?? null;
+    for (const [panel, bound] of this.panels) {
+      if (bound === activeId || bound === null) {
+        panel.reveal();
+        return;
+      }
     }
+    this.createTab();
+  }
+
+  /**
+   * Always open a NEW chat tab bound to the active session (the "+" button).
+   * Older tabs bound to previous sessions freeze as read-only transcripts.
+   */
+  openNewTab(): void {
+    this.createTab();
+  }
+
+  private createTab(): void {
     const panel = vscode.window.createWebviewPanel(
       'acp-chat-tab',
       'ACP Chat',
@@ -84,11 +101,22 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       { retainContextWhenHidden: true, enableScripts: true },
     );
     panel.iconPath = vscode.Uri.joinPath(this.extensionUri, 'resources', 'icon.svg');
-    this.panel = panel;
+    this.panels.set(panel, this.sessionManager.getActiveSessionId() ?? null);
     this.attachWebview(panel.webview);
     panel.onDidDispose(() => {
-      if (this.panel === panel) this.panel = undefined;
+      this.panels.delete(panel);
     });
+  }
+
+  /** Webviews that should receive active-session traffic. */
+  private activeWebviews(): vscode.Webview[] {
+    const activeId = this.sessionManager.getActiveSessionId() ?? null;
+    const out: vscode.Webview[] = [];
+    if (this.view) out.push(this.view.webview);
+    for (const [panel, bound] of this.panels) {
+      if (bound === null || bound === activeId) out.push(panel.webview);
+    }
+    return out;
   }
 
   /**
@@ -142,8 +170,8 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           }
           break;
         case 'ready':
-          // Webview loaded — send current session state
-          this.sendCurrentState();
+          // Webview loaded — send current session state (host-local)
+          this.sendCurrentState(webview);
           break;
         case 'renderMarkdown': {
           // Webview requests markdown rendering for history items
@@ -317,10 +345,13 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   /**
    * Send current session state to the webview on load.
    */
-  private sendCurrentState(): void {
+  private sendCurrentState(target?: vscode.Webview): void {
     const activeId = this.sessionManager.getActiveSessionId();
     const session = activeId ? this.sessionManager.getSession(activeId) : null;
-    this.postMessage({
+    const send = target
+      ? (msg: any) => { target.postMessage(msg); }
+      : (msg: any) => { this.postMessage(msg); };
+    send({
       type: 'state',
       activeSessionId: activeId,
       session: session ? {
@@ -337,17 +368,28 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Post a message to the webview if it exists.
+   * Post a message to every webview following the active session.
+   * Tabs bound to older sessions are frozen transcripts and receive nothing.
    */
   private postMessage(message: any): void {
-    this.view?.webview.postMessage(message);
-    this.panel?.webview.postMessage(message);
+    for (const webview of this.activeWebviews()) {
+      webview.postMessage(message);
+    }
   }
 
   /**
-   * Notify webview of a new active session.
+   * Notify webview of a new active session. Tabs still bound to a previous
+   * session freeze; unbound tabs adopt the new session.
    */
   notifyActiveSessionChanged(): void {
+    const activeId = this.sessionManager.getActiveSessionId() ?? null;
+    for (const [panel, bound] of this.panels) {
+      if (bound === null && activeId !== null) {
+        this.panels.set(panel, activeId);
+      } else if (bound !== null && activeId !== null && bound !== activeId) {
+        panel.webview.postMessage({ type: 'frozen' });
+      }
+    }
     this.sendCurrentState();
   }
 
@@ -2523,6 +2565,16 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           }
           break;
 
+        case 'frozen':
+          // This tab's conversation moved on (a new chat tab was opened).
+          // Keep the transcript, disable the composer.
+          hasActiveSession = false;
+          if (inputArea) inputArea.classList.add('disabled');
+          promptInput.disabled = true;
+          promptInput.placeholder = 'This conversation ended — use + for a new chat';
+          if (statusEl) statusEl.textContent = 'ended';
+          break;
+
         case 'promptStart':
           setProcessing(true);
           currentAssistantEl = null;
@@ -2836,21 +2888,26 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
    * Attach a file URI — notify the webview to include it in the next prompt.
    */
   attachFile(uri: vscode.Uri): void {
-    if (!this.view && !this.panel) return;
     this.postMessage({
       type: 'file-attached',
       path: uri.fsPath,
       name: uri.fsPath.split(/[\\/]/).pop() || uri.fsPath,
     });
-    if (this.panel) {
-      this.panel.reveal();
-    } else {
-      this.view?.show?.(true);
+    const activeId = this.sessionManager.getActiveSessionId() ?? null;
+    for (const [panel, bound] of this.panels) {
+      if (bound === null || bound === activeId) {
+        panel.reveal();
+        return;
+      }
     }
+    this.view?.show?.(true);
   }
 
   dispose(): void {
-    this.panel?.dispose();
+    for (const panel of this.panels.keys()) {
+      panel.dispose();
+    }
+    this.panels.clear();
     this.sessionUpdateHandler.removeListener(this.updateListener);
   }
 }
