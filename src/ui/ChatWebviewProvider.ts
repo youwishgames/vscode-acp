@@ -125,7 +125,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     log(`createTab: opening chat tab (bound session: ${bound ?? 'none yet'})`);
     const panel = vscode.window.createWebviewPanel(
       'acp-chat-tab',
-      'ACP Chat',
+      'ClawCode',
       vscode.ViewColumn.Active,
       {
         retainContextWhenHidden: true,
@@ -557,6 +557,12 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   /** Notify a session's webviews that its title / metadata changed. */
   notifySessionInfoUpdate(sessionId: string, title: string | undefined | null): void {
     this.postToSession(sessionId, { type: 'sessionInfoUpdate', title: title ?? null });
+    // Mirror onto the editor-tab label so parallel tabs are tellable apart.
+    for (const [panel, bound] of this.panels) {
+      if (bound === sessionId) {
+        panel.title = title ? `ClawCode: ${title}` : 'ClawCode';
+      }
+    }
   }
 
   // --- Inline permissions ---
@@ -628,7 +634,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
-  <title>ACP Chat</title>
+  <title>ClawCode</title>
   <style>
     :root {
       --container-padding: 12px;
@@ -1619,7 +1625,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   <div class="messages" id="messages">
     <div class="empty-state" id="emptyState">
       <div class="icon">🤖</div>
-      <div class="title">ACP Chat</div>
+      <div class="title">ClawCode</div>
       <div class="subtitle">Connect to an AI coding agent to start chatting.</div>
       <div class="actions">
         <button class="action-btn primary" id="welcomeConnectAgent">
