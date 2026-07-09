@@ -7,7 +7,7 @@ import { Readable, Writable } from 'node:stream';
 import { AcpClientImpl } from './AcpClientImpl';
 import { FileSystemHandler } from '../handlers/FileSystemHandler';
 import { TerminalHandler } from '../handlers/TerminalHandler';
-import { PermissionHandler } from '../handlers/PermissionHandler';
+import { PermissionHandler, PermissionUi } from '../handlers/PermissionHandler';
 import { SessionUpdateHandler } from '../handlers/SessionUpdateHandler';
 import { log, logError, logTraffic } from '../utils/Logger';
 import { version as extensionVersion } from '../../package.json';
@@ -24,10 +24,20 @@ export interface ConnectionInfo {
  */
 export class ConnectionManager {
   private connections: Map<string, ConnectionInfo> = new Map();
+  private permissionUi: PermissionUi | null = null;
 
   constructor(
     private readonly sessionUpdateHandler: SessionUpdateHandler,
   ) {}
+
+  /**
+   * Wire the chat UI delegate used for inline permission prompts.
+   * Applied to every PermissionHandler created from now on (and there is
+   * one per connection).
+   */
+  setPermissionUi(ui: PermissionUi): void {
+    this.permissionUi = ui;
+  }
 
   /**
    * Create an ACP connection from a child process.
@@ -52,7 +62,7 @@ export class ConnectionManager {
     // Create handlers
     const fsHandler = new FileSystemHandler();
     const terminalHandler = new TerminalHandler();
-    const permissionHandler = new PermissionHandler();
+    const permissionHandler = new PermissionHandler(this.permissionUi);
 
     // Create client implementation
     const client = new AcpClientImpl(

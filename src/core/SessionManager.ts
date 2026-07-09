@@ -73,8 +73,11 @@ export class SessionManager extends EventEmitter {
   private sessions: Map<string, SessionInfo> = new Map();
   private activeSessionId: string | null = null;
 
-  /** Maps agentName → activeSessionId for the one-session-per-agent model. */
-  private agentSessions: Map<string, string> = new Map();
+  /**
+   * Maps agentName → live session IDs. Multiple sessions can run
+   * concurrently on one agent connection (parallel chat tabs).
+   */
+  private agentSessions: Map<string, Set<string>> = new Map();
 
   /**
    * Buffers session/update payloads that arrive before the corresponding
@@ -139,16 +142,45 @@ export class SessionManager extends EventEmitter {
     };
   }
 
+  /** Track a session id under its agent's live-session set. */
+  private trackAgentSession(agentName: string, sessionId: string): void {
+    let set = this.agentSessions.get(agentName);
+    if (!set) {
+      set = new Set();
+      this.agentSessions.set(agentName, set);
+    }
+    set.add(sessionId);
+  }
+
+  /** Untrack a session id; drops the agent entry when its set empties. */
+  private untrackAgentSession(agentName: string, sessionId: string): void {
+    const set = this.agentSessions.get(agentName);
+    if (!set) { return; }
+    set.delete(sessionId);
+    if (set.size === 0) { this.agentSessions.delete(agentName); }
+  }
+
+  /** Any live session id for an agent (most convenient for connection reuse). */
+  private anyAgentSessionId(agentName: string): string | undefined {
+    const set = this.agentSessions.get(agentName);
+    if (!set) { return undefined; }
+    for (const id of set) {
+      if (this.sessions.has(id)) { return id; }
+    }
+    return undefined;
+  }
+
   /**
    * Connect to an agent and start chatting.
    * Only one agent can be connected at a time — automatically disconnects
-   * any previously connected agent.
+   * any previously connected agent. Within that agent, multiple sessions
+   * can run concurrently (parallel chat tabs).
    * Internally creates a session via ACP protocol.
    */
   async connectToAgent(agentName: string): Promise<SessionInfo> {
     // If we already have a live session with this agent, reuse it
-    const existingSessionId = this.agentSessions.get(agentName);
-    if (existingSessionId && this.sessions.has(existingSessionId)) {
+    const existingSessionId = this.anyAgentSessionId(agentName);
+    if (existingSessionId) {
       this.activeSessionId = existingSessionId;
       this.emit('active-session-changed', existingSessionId);
       return this.sessions.get(existingSessionId)!;
@@ -188,16 +220,18 @@ export class SessionManager extends EventEmitter {
       this.agentManager.on('agent-closed', (evt: { agentId: string; code: number | null }) => {
         if (evt.agentId === agentId) {
           log(`Agent ${agentName} closed with code ${evt.code}`);
-          // Clean up the session for this agent
-          const sessionId = this.agentSessions.get(agentName);
-          if (sessionId) {
-            this.sessions.delete(sessionId);
-            this.agentSessions.delete(agentName);
-            if (this.activeSessionId === sessionId) {
-              this.activeSessionId = null;
+          // Clean up every session for this agent (process is gone)
+          const sessionIds = this.agentSessions.get(agentName);
+          if (sessionIds && sessionIds.size > 0) {
+            for (const sessionId of sessionIds) {
+              this.sessions.delete(sessionId);
+              if (this.activeSessionId === sessionId) {
+                this.activeSessionId = null;
+              }
             }
+            this.agentSessions.delete(agentName);
             this.emit('agent-disconnected', agentName);
-            this.emit('active-session-changed', null);
+            this.emit('active-session-changed', this.activeSessionId);
           }
           this.emit('agent-closed', agentId, evt.code);
         }
@@ -222,7 +256,7 @@ export class SessionManager extends EventEmitter {
       // notifications arriving during/after newSession can be persisted.
       const sessionInfo = await this.createAcpSession(agentName, agentId, connInfo, workspaceCwd);
 
-      this.agentSessions.set(agentName, sessionInfo.sessionId);
+      this.trackAgentSession(agentName, sessionInfo.sessionId);
       this.activeSessionId = sessionInfo.sessionId;
 
       this.emit('agent-connected', agentName);
@@ -238,8 +272,42 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Create an ADDITIONAL live session on the agent's existing connection —
+   * previous sessions keep running (parallel chats). The new session
+   * becomes the active one (the sidebar follows it); existing tabs bound
+   * to their own sessions are unaffected.
+   */
+  async createParallelSession(agentName: string): Promise<SessionInfo> {
+    const existingSessionId = this.anyAgentSessionId(agentName);
+    const existing = existingSessionId ? this.sessions.get(existingSessionId) : undefined;
+    const connInfo = existing
+      ? this.connectionManager.getConnection(existing.agentId)
+      : undefined;
+
+    if (!existing || !connInfo) {
+      // No live connection — plain connect creates the first session.
+      return this.connectToAgent(agentName);
+    }
+
+    const sessionInfo = await this.createAcpSession(
+      agentName,
+      existing.agentId,
+      connInfo,
+      this.getWorkspaceCwd(),
+    );
+    this.trackAgentSession(agentName, sessionInfo.sessionId);
+    this.activeSessionId = sessionInfo.sessionId;
+    this.emit('active-session-changed', sessionInfo.sessionId);
+    log(`Created parallel session ${sessionInfo.sessionId} for agent ${agentName}`);
+    sendEvent('session/parallelCreated', { agentName });
+    return sessionInfo;
+  }
+
+  /**
    * Start a new conversation with the currently connected agent.
-   * Disconnects current session, reconnects, and signals chat to clear.
+   * Creates a fresh session on the same connection (previous sessions
+   * stay live in their own tabs) and signals the active-follower chat
+   * surfaces to clear.
    */
   async newConversation(): Promise<SessionInfo | null> {
     const activeSession = this.getActiveSession();
@@ -247,32 +315,35 @@ export class SessionManager extends EventEmitter {
       return null;
     }
 
-    const agentName = activeSession.agentName;
-    await this.disconnectAgent(agentName);
+    const sessionInfo = await this.createParallelSession(activeSession.agentName);
     this.emit('clear-chat');
-    return this.connectToAgent(agentName);
+    return sessionInfo;
   }
 
   /**
-   * Disconnect from an agent: kill process and clean up.
+   * Disconnect from an agent: kill process and clean up ALL its sessions.
    */
   async disconnectAgent(agentName: string): Promise<void> {
-    const sessionId = this.agentSessions.get(agentName);
-    if (!sessionId) { return; }
-
-    const session = this.sessions.get(sessionId);
-    if (!session) { return; }
+    const sessionIds = this.agentSessions.get(agentName);
+    if (!sessionIds || sessionIds.size === 0) { return; }
 
     log(`Disconnecting agent ${agentName}`);
     sendEvent('agent/disconnect', { agentName });
 
-    this.agentManager.killAgent(session.agentId);
-    this.connectionManager.removeConnection(session.agentId);
-    this.sessions.delete(sessionId);
+    let agentId: string | null = null;
+    for (const sessionId of sessionIds) {
+      const session = this.sessions.get(sessionId);
+      if (session) { agentId = session.agentId; }
+      this.sessions.delete(sessionId);
+      if (this.activeSessionId === sessionId) {
+        this.activeSessionId = null;
+      }
+    }
     this.agentSessions.delete(agentName);
 
-    if (this.activeSessionId === sessionId) {
-      this.activeSessionId = null;
+    if (agentId) {
+      this.agentManager.killAgent(agentId);
+      this.connectionManager.removeConnection(agentId);
     }
 
     this.emit('agent-disconnected', agentName);
@@ -652,7 +723,7 @@ export class SessionManager extends EventEmitter {
    */
   async ensureConnected(agentName: string): Promise<ConnectionInfo> {
     // If we already have a live session with this agent, reuse its connection.
-    const existingSessionId = this.agentSessions.get(agentName);
+    const existingSessionId = this.anyAgentSessionId(agentName);
     if (existingSessionId) {
       const existing = this.sessions.get(existingSessionId);
       if (existing) {
@@ -767,18 +838,8 @@ export class SessionManager extends EventEmitter {
       throw new Error(`Agent "${agentName}" does not support session/load.`);
     }
 
-    // If the same agent has a different active session, clear it so the
-    // load can take over as the new active session.
-    const previouslyActive = this.activeSessionId;
-    if (previouslyActive && previouslyActive !== sessionId) {
-      const prevSession = this.sessions.get(previouslyActive);
-      if (prevSession) {
-        this.agentSessions.delete(prevSession.agentName);
-      }
-      this.sessions.delete(previouslyActive);
-      this.activeSessionId = null;
-    }
-
+    // Other live sessions keep running — the loaded session simply becomes
+    // the new active one (multi-session model).
     const cwd = this.getWorkspaceCwd();
     const agentId = this.findAgentIdForConnection(conn);
     if (!agentId) {
@@ -809,7 +870,7 @@ export class SessionManager extends EventEmitter {
     // Mark this session as active up front so handleSessionUpdate forwards
     // the replayed chunks to the webview during the load. Without this,
     // updates arrive before the activeSessionId is set and are dropped.
-    this.agentSessions.set(agentName, sessionId);
+    this.trackAgentSession(agentName, sessionId);
     this.activeSessionId = sessionId;
     // Emit active-session-changed BEFORE session-load-start so the webview
     // first repaints from the new session state, then immediately enters
@@ -831,7 +892,7 @@ export class SessionManager extends EventEmitter {
     } catch (e: any) {
       this.loadingSessionIds.delete(sessionId);
       this.sessions.delete(sessionId);
-      this.agentSessions.delete(agentName);
+      this.untrackAgentSession(agentName, sessionId);
       if (this.activeSessionId === sessionId) { this.activeSessionId = null; }
       this.emit('session-load-end', sessionId, agentName, /*ok=*/false);
       this.emit('active-session-changed', null);
@@ -868,17 +929,7 @@ export class SessionManager extends EventEmitter {
       throw new Error(`Agent "${agentName}" does not support session/resume.`);
     }
 
-    // If the same agent has a different active session, clear it.
-    const previouslyActive = this.activeSessionId;
-    if (previouslyActive && previouslyActive !== sessionId) {
-      const prevSession = this.sessions.get(previouslyActive);
-      if (prevSession) {
-        this.agentSessions.delete(prevSession.agentName);
-      }
-      this.sessions.delete(previouslyActive);
-      this.activeSessionId = null;
-    }
-
+    // Other live sessions keep running (multi-session model).
     const cwd = this.getWorkspaceCwd();
     const agentId = this.findAgentIdForConnection(conn);
     if (!agentId) {
@@ -917,7 +968,7 @@ export class SessionManager extends EventEmitter {
     };
     this.sessions.set(sessionId, sessionInfo);
     this.drainPending(sessionInfo);
-    this.agentSessions.set(agentName, sessionId);
+    this.trackAgentSession(agentName, sessionId);
     this.activeSessionId = sessionId;
     this.emit('agent-connected', agentName);
     this.emit('active-session-changed', sessionId);
@@ -970,12 +1021,17 @@ export class SessionManager extends EventEmitter {
 
   /** Check if a specific agent is currently connected. */
   isAgentConnected(agentName: string): boolean {
-    return this.agentSessions.has(agentName);
+    return (this.agentSessions.get(agentName)?.size ?? 0) > 0;
   }
 
   /** Get all connected agent names. */
   getConnectedAgentNames(): string[] {
     return Array.from(this.agentSessions.keys());
+  }
+
+  /** All live session IDs (across agents). */
+  getLiveSessionIds(): string[] {
+    return Array.from(this.sessions.keys());
   }
 
   getConnectionForSession(sessionId: string): ConnectionInfo | undefined {

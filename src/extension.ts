@@ -78,27 +78,34 @@ export function activate(context: vscode.ExtensionContext): void {
     chatWebviewProvider.clearChat();
   });
 
-  // Forward mode/model changes to webview
-  sessionManager.on('mode-changed', (_sessionId: string, _modeId: string) => {
-    const session = sessionManager.getActiveSession();
+  // Route inline permission prompts + per-session modes through the chat UI.
+  connectionManager.setPermissionUi(chatWebviewProvider);
+
+  // Forward mode/model changes to the owning session's webviews
+  sessionManager.on('mode-changed', (sessionId: string, _modeId: string) => {
+    const session = sessionManager.getSession(sessionId);
     if (session?.modes) {
-      chatWebviewProvider.notifyModesUpdate(session.modes);
+      chatWebviewProvider.notifyModesUpdate(sessionId, session.modes);
     }
   });
 
-  sessionManager.on('model-changed', (_sessionId: string, _modelId: string) => {
-    const session = sessionManager.getActiveSession();
+  sessionManager.on('model-changed', (sessionId: string, _modelId: string) => {
+    const session = sessionManager.getSession(sessionId);
     if (session?.models) {
-      chatWebviewProvider.notifyModelsUpdate(session.models);
+      chatWebviewProvider.notifyModelsUpdate(sessionId, session.models);
     }
+  });
+
+  sessionManager.on('config-options-changed', (sessionId: string, configOptions: any) => {
+    chatWebviewProvider.notifyConfigOptionsUpdate(sessionId, configOptions);
   });
 
   // Session-load replay state — drive the webview overlay.
-  sessionManager.on('session-load-start', () => {
-    chatWebviewProvider.notifyLoadSessionStart();
+  sessionManager.on('session-load-start', (sessionId: string) => {
+    chatWebviewProvider.notifyLoadSessionStart(sessionId);
   });
-  sessionManager.on('session-load-end', (_sessionId: string, _agentName: string, ok: boolean) => {
-    chatWebviewProvider.notifyLoadSessionEnd(ok);
+  sessionManager.on('session-load-end', (sessionId: string, _agentName: string, ok: boolean) => {
+    chatWebviewProvider.notifyLoadSessionEnd(sessionId, ok);
     if (ok) {
       // The loadSession response carries modes/models/configOptions for the
       // restored session. Re-send the state so the pickers pick them up
@@ -108,10 +115,9 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   });
 
-  // Session metadata (title) update — forward to chat banner.
+  // Session metadata (title) update — forward to the owning session's banner.
   sessionManager.on('session-info-changed', (sessionId: string, update: any) => {
-    if (sessionId !== sessionManager.getActiveSessionId()) { return; }
-    chatWebviewProvider.notifySessionInfoUpdate(update?.title);
+    chatWebviewProvider.notifySessionInfoUpdate(sessionId, update?.title);
   });
 
   // --- Commands ---
@@ -232,25 +238,31 @@ export function activate(context: vscode.ExtensionContext): void {
     chatWebviewProvider.openAsTab();
   });
 
-  // "+" — start a new conversation in a NEW chat tab (previous tab keeps
-  // its transcript, frozen). Falls back to connect when nothing is active.
+  // "+" — start a PARALLEL conversation in a NEW chat tab. Existing tabs
+  // keep their own live sessions running. Falls back to connect when
+  // nothing is active.
   const newChatTabCmd = vscode.commands.registerCommand('acp.newChatTab', async () => {
-    if (!sessionManager.getActiveSession()) {
+    const activeSession = sessionManager.getActiveSession();
+    if (!activeSession) {
       await vscode.commands.executeCommand('acp.connectAgent');
       return;
     }
     try {
+      let newSessionId: string | undefined;
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: 'Starting new conversation...',
+          title: 'Starting new parallel chat...',
           cancellable: false,
         },
         async () => {
-          await sessionManager.newConversation();
+          const info = await sessionManager.createParallelSession(activeSession.agentName);
+          newSessionId = info.sessionId;
         },
       );
-      chatWebviewProvider.openNewTab();
+      if (newSessionId) {
+        chatWebviewProvider.openTabForSession(newSessionId);
+      }
     } catch (e: any) {
       logError('Failed to open new chat tab', e);
       vscode.window.showErrorMessage(`Failed to start new chat: ${e.message}`);

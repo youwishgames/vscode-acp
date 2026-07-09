@@ -2,24 +2,37 @@ import * as vscode from 'vscode';
 import { marked } from 'marked';
 import { SessionManager } from '../core/SessionManager';
 import { SessionUpdateHandler, SessionUpdateListener } from '../handlers/SessionUpdateHandler';
-import type { SessionNotification } from '@agentclientprotocol/sdk';
+import type { RequestPermissionRequest, SessionNotification } from '@agentclientprotocol/sdk';
 import { log, logError } from '../utils/Logger';
 import { sendEvent } from '../utils/TelemetryManager';
+
+export type PermissionMode = 'ask' | 'acceptEdits' | 'allowAll';
 
 /**
  * WebviewViewProvider for the ACP chat sidebar.
  * Renders chat messages, tool calls, plans, and handles user input.
+ *
+ * Multi-session model: each editor tab (webview panel) is bound to its own
+ * LIVE session; the sidebar view follows the active session. All traffic is
+ * routed per session id — parallel conversations stream side by side.
  */
 export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'acp-chat';
 
   private view?: vscode.WebviewView;
   // Chat tabs -> the session id each is bound to (null = adopts the next
-  // active session). The sidebar view always follows the active session.
+  // active session). Every bound tab is LIVE — it sends and receives for
+  // its own session regardless of which session is "active".
   private panels = new Map<vscode.WebviewPanel, string | null>();
   private readyWatchdogs = new Map<vscode.Webview, ReturnType<typeof setTimeout>>();
   private updateListener: SessionUpdateListener;
   private _hasChatContent = false;
+
+  /** Per-session permission mode (defaults from acp.autoApprovePermissions). */
+  private permissionModes = new Map<string, PermissionMode>();
+  /** Pending inline permission requests: requestId → resolver. */
+  private pendingPermissions = new Map<string, { sessionId: string; resolve: (optionId: string | null) => void }>();
+  private permissionSeq = 0;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -87,15 +100,26 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Always open a NEW chat tab bound to the active session (the "+" button).
-   * Older tabs bound to previous sessions freeze as read-only transcripts.
+   * Open a NEW chat tab bound to the active session (the "+" button).
+   * Existing tabs keep their own live sessions running in parallel.
    */
   openNewTab(): void {
     this.createTab();
   }
 
-  private createTab(): void {
-    const bound = this.sessionManager.getActiveSessionId() ?? null;
+  /** Open a chat tab bound to a specific session id. */
+  openTabForSession(sessionId: string): void {
+    for (const [panel, bound] of this.panels) {
+      if (bound === sessionId) {
+        panel.reveal();
+        return;
+      }
+    }
+    this.createTab(sessionId);
+  }
+
+  private createTab(sessionId?: string): void {
+    const bound = sessionId ?? this.sessionManager.getActiveSessionId() ?? null;
     log(`createTab: opening chat tab (bound session: ${bound ?? 'none yet'})`);
     const panel = vscode.window.createWebviewPanel(
       'acp-chat-tab',
@@ -117,6 +141,14 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     });
     panel.onDidDispose(() => {
       this.panels.delete(panel);
+      // Resolve any pending permission requests that just lost their last
+      // surface — the handler falls back to a QuickPick.
+      for (const [requestId, pending] of this.pendingPermissions) {
+        if (this.webviewsForSession(pending.sessionId).length === 0) {
+          this.pendingPermissions.delete(requestId);
+          pending.resolve(null);
+        }
+      }
     });
     // Watchdog: if the page's script never reports in, say so loudly.
     const watchdog = setTimeout(() => {
@@ -134,6 +166,42 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       if (bound === null || bound === activeId) out.push(panel.webview);
     }
     return out;
+  }
+
+  /**
+   * Webviews that display a specific session: tabs bound to it, plus the
+   * sidebar/unbound tabs when it is the active session.
+   */
+  private webviewsForSession(sessionId: string): vscode.Webview[] {
+    const activeId = this.sessionManager.getActiveSessionId() ?? null;
+    const out: vscode.Webview[] = [];
+    if (this.view && sessionId === activeId) out.push(this.view.webview);
+    for (const [panel, bound] of this.panels) {
+      if (bound === sessionId || (bound === null && sessionId === activeId)) {
+        out.push(panel.webview);
+      }
+    }
+    return out;
+  }
+
+  /** Post a message to every webview displaying the given session. */
+  private postToSession(sessionId: string, message: any): void {
+    for (const webview of this.webviewsForSession(sessionId)) {
+      webview.postMessage(message);
+    }
+  }
+
+  /**
+   * Resolve which session a webview's messages act on: a bound tab acts on
+   * its own session; the sidebar and unbound tabs act on the active session.
+   */
+  private sessionForWebview(webview: vscode.Webview): string | null {
+    for (const [panel, bound] of this.panels) {
+      if (panel.webview === webview) {
+        return bound ?? this.sessionManager.getActiveSessionId();
+      }
+    }
+    return this.sessionManager.getActiveSessionId();
   }
 
   /**
@@ -155,19 +223,47 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
         case 'sendPrompt':
           log(`webview -> sendPrompt (${(message.text || '').length} chars)`);
           this._hasChatContent = true;
-          await this.handleSendPrompt(message.text);
+          await this.handleSendPrompt(message.text, webview);
           break;
         case 'cancelTurn':
-          await this.handleCancelTurn();
+          await this.handleCancelTurn(webview);
           break;
         case 'setMode':
-          await this.handleSetMode(message.modeId);
+          await this.handleSetMode(message.modeId, webview);
           break;
         case 'setModel':
-          await this.handleSetModel(message.modelId);
+          await this.handleSetModel(message.modelId, webview);
           break;
         case 'setConfigOption':
-          await this.handleSetConfigOption(message.configId, message.value);
+          await this.handleSetConfigOption(message.configId, message.value, webview);
+          break;
+        case 'setPermissionMode': {
+          const sessionId = this.sessionForWebview(webview);
+          const mode = message.mode as PermissionMode;
+          if (sessionId && (mode === 'ask' || mode === 'acceptEdits' || mode === 'allowAll')) {
+            this.permissionModes.set(sessionId, mode);
+            log(`permission mode for ${sessionId}: ${mode}`);
+            this.postToSession(sessionId, { type: 'permissionModeUpdate', mode });
+          }
+          break;
+        }
+        case 'permissionResponse': {
+          const pending = this.pendingPermissions.get(message.requestId);
+          if (pending) {
+            this.pendingPermissions.delete(message.requestId);
+            this.postToSession(pending.sessionId, {
+              type: 'permissionResolved',
+              requestId: message.requestId,
+              optionId: message.optionId ?? null,
+            });
+            pending.resolve(message.optionId ?? null);
+          }
+          break;
+        }
+        case 'copyText':
+          if (typeof message.text === 'string' && message.text) {
+            await vscode.env.clipboard.writeText(message.text);
+          }
           break;
         case 'executeCommand':
           log(`webview -> executeCommand: ${message.command}`);
@@ -249,12 +345,9 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       });
     }
 
-    // Only forward to the webview if this is the active session — the
-    // webview only ever shows one session at a time.
-    const activeId = this.sessionManager.getActiveSessionId();
-    if (update.sessionId !== activeId) { return; }
-
-    this.postMessage({
+    // Route to every webview displaying this session — parallel tabs each
+    // receive their own session's traffic.
+    this.postToSession(update.sessionId, {
       type: 'sessionUpdate',
       update: update.update,
       sessionId: update.sessionId,
@@ -262,12 +355,12 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Handle a prompt sent from the webview.
+   * Handle a prompt sent from a webview — acts on THAT webview's session.
    */
-  private async handleSendPrompt(text: string): Promise<void> {
-    const activeId = this.sessionManager.getActiveSessionId();
-    if (!activeId) {
-      this.postMessage({
+  private async handleSendPrompt(text: string, webview: vscode.Webview): Promise<void> {
+    const sessionId = this.sessionForWebview(webview);
+    if (!sessionId) {
+      webview.postMessage({
         type: 'error',
         message: 'No active session. Create a session first.',
       });
@@ -275,46 +368,44 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     sendEvent('chat/messageSent', {
-      agentName: this.sessionManager.getActiveAgentName() ?? '',
+      agentName: this.sessionManager.getSession(sessionId)?.agentName ?? '',
     }, {
       messageLength: text.length,
     });
 
     // Record the first prompt for the history store (used as a label
     // fallback when no title is supplied by the agent).
-    this.sessionManager.recordFirstPrompt(activeId, text);
+    this.sessionManager.recordFirstPrompt(sessionId, text);
 
-    // Tell webview we're processing
-    this.postMessage({ type: 'promptStart' });
+    // Tell this session's webviews we're processing
+    this.postToSession(sessionId, { type: 'promptStart' });
 
     try {
-      const response = await this.sessionManager.sendPrompt(activeId, text);
-      // Render the accumulated assistant text as markdown
-      // The webview will have sent us the raw text via promptEnd handling
-      this.postMessage({
+      const response = await this.sessionManager.sendPrompt(sessionId, text);
+      this.postToSession(sessionId, {
         type: 'promptEnd',
         stopReason: response.stopReason,
         usage: (response as any).usage,
       });
-      this.sessionManager.touchHistory(activeId);
+      this.sessionManager.touchHistory(sessionId);
     } catch (e: any) {
       logError('Prompt failed', e);
-      this.postMessage({
+      this.postToSession(sessionId, {
         type: 'error',
         message: e.message || 'Prompt failed',
       });
-      this.postMessage({ type: 'promptEnd', stopReason: 'error' });
+      this.postToSession(sessionId, { type: 'promptEnd', stopReason: 'error' });
     }
   }
 
   /**
-   * Handle cancel request from webview.
+   * Handle cancel request from a webview — cancels that webview's session.
    */
-  private async handleCancelTurn(): Promise<void> {
-    const activeId = this.sessionManager.getActiveSessionId();
-    if (activeId) {
+  private async handleCancelTurn(webview: vscode.Webview): Promise<void> {
+    const sessionId = this.sessionForWebview(webview);
+    if (sessionId) {
       try {
-        await this.sessionManager.cancelTurn(activeId);
+        await this.sessionManager.cancelTurn(sessionId);
       } catch (e) {
         logError('Cancel failed', e);
       }
@@ -324,28 +415,28 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   /**
    * Handle mode change from webview picker.
    */
-  private async handleSetMode(modeId: string): Promise<void> {
-    const activeId = this.sessionManager.getActiveSessionId();
-    if (!activeId || !modeId) { return; }
+  private async handleSetMode(modeId: string, webview: vscode.Webview): Promise<void> {
+    const sessionId = this.sessionForWebview(webview);
+    if (!sessionId || !modeId) { return; }
     try {
-      await this.sessionManager.setMode(activeId, modeId);
+      await this.sessionManager.setMode(sessionId, modeId);
     } catch (e: any) {
       logError('Failed to set mode', e);
-      this.postMessage({ type: 'error', message: `Failed to set mode: ${e.message}` });
+      this.postToSession(sessionId, { type: 'error', message: `Failed to set mode: ${e.message}` });
     }
   }
 
   /**
    * Handle model change from webview picker.
    */
-  private async handleSetModel(modelId: string): Promise<void> {
-    const activeId = this.sessionManager.getActiveSessionId();
-    if (!activeId || !modelId) { return; }
+  private async handleSetModel(modelId: string, webview: vscode.Webview): Promise<void> {
+    const sessionId = this.sessionForWebview(webview);
+    if (!sessionId || !modelId) { return; }
     try {
-      await this.sessionManager.setModel(activeId, modelId);
+      await this.sessionManager.setModel(sessionId, modelId);
     } catch (e: any) {
       logError('Failed to set model', e);
-      this.postMessage({ type: 'error', message: `Failed to set model: ${e.message}` });
+      this.postToSession(sessionId, { type: 'error', message: `Failed to set model: ${e.message}` });
     }
   }
 
@@ -355,18 +446,18 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
    * configOptions state which we re-broadcast so any cascading
    * changes are reflected in the UI.
    */
-  private async handleSetConfigOption(configId: string, value: string): Promise<void> {
-    const activeId = this.sessionManager.getActiveSessionId();
-    if (!activeId || !configId) { return; }
+  private async handleSetConfigOption(configId: string, value: string, webview: vscode.Webview): Promise<void> {
+    const sessionId = this.sessionForWebview(webview);
+    if (!sessionId || !configId) { return; }
     try {
-      const options = await this.sessionManager.setConfigOption(activeId, configId, value);
-      this.postMessage({ type: 'configOptionsUpdate', configOptions: options });
+      const options = await this.sessionManager.setConfigOption(sessionId, configId, value);
+      this.postToSession(sessionId, { type: 'configOptionsUpdate', configOptions: options });
     } catch (e: any) {
       logError('Failed to set config option', e);
-      this.postMessage({ type: 'error', message: `Failed to set ${configId}: ${e.message}` });
+      this.postToSession(sessionId, { type: 'error', message: `Failed to set ${configId}: ${e.message}` });
       // Roll back optimistic update on the webview by replaying current state
-      const session = this.sessionManager.getSession(activeId);
-      this.postMessage({
+      const session = this.sessionManager.getSession(sessionId);
+      this.postToSession(sessionId, {
         type: 'configOptionsUpdate',
         configOptions: session?.configOptions ?? null,
       });
@@ -374,17 +465,21 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Send current session state to the webview on load.
+   * Send current session state to the webview on load. A bound tab gets
+   * ITS session's state; the sidebar/unbound tabs get the active session.
    */
   private sendCurrentState(target?: vscode.Webview): void {
-    const activeId = this.sessionManager.getActiveSessionId();
-    const session = activeId ? this.sessionManager.getSession(activeId) : null;
+    const sessionId = target
+      ? this.sessionForWebview(target)
+      : this.sessionManager.getActiveSessionId();
+    const session = sessionId ? this.sessionManager.getSession(sessionId) : null;
     const send = target
       ? (msg: any) => { target.postMessage(msg); }
       : (msg: any) => { this.postMessage(msg); };
     send({
       type: 'state',
-      activeSessionId: activeId,
+      activeSessionId: sessionId,
+      permissionMode: sessionId ? this.getPermissionMode(sessionId) : this.defaultPermissionMode(),
       session: session ? {
         sessionId: session.sessionId,
         agentName: session.agentDisplayName,
@@ -409,59 +504,98 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Notify webview of a new active session. Tabs still bound to a previous
-   * session freeze; unbound tabs adopt the new session.
+   * Notify webviews of a new active session. Unbound tabs adopt it; tabs
+   * bound to other sessions keep running their own live conversations.
    */
   notifyActiveSessionChanged(): void {
     const activeId = this.sessionManager.getActiveSessionId() ?? null;
     for (const [panel, bound] of this.panels) {
       if (bound === null && activeId !== null) {
         this.panels.set(panel, activeId);
-      } else if (bound !== null && activeId !== null && bound !== activeId) {
-        panel.webview.postMessage({ type: 'frozen' });
       }
     }
     this.sendCurrentState();
   }
 
   /**
-   * Notify webview of mode state changes.
+   * Notify a session's webviews of mode state changes.
    */
-  notifyModesUpdate(modes: any): void {
-    this.postMessage({ type: 'modesUpdate', modes });
+  notifyModesUpdate(sessionId: string, modes: any): void {
+    this.postToSession(sessionId, { type: 'modesUpdate', modes });
   }
 
   /**
-   * Notify webview of model state changes.
+   * Notify a session's webviews of model state changes.
    */
-  notifyModelsUpdate(models: any): void {
-    this.postMessage({ type: 'modelsUpdate', models });
+  notifyModelsUpdate(sessionId: string, models: any): void {
+    this.postToSession(sessionId, { type: 'modelsUpdate', models });
   }
 
   /**
-   * Notify webview of session config-option state changes.
+   * Notify a session's webviews of config-option state changes.
    */
-  notifyConfigOptionsUpdate(configOptions: any): void {
-    this.postMessage({ type: 'configOptionsUpdate', configOptions });
+  notifyConfigOptionsUpdate(sessionId: string, configOptions: any): void {
+    this.postToSession(sessionId, { type: 'configOptionsUpdate', configOptions });
   }
 
   /**
-   * Notify webview that a `session/load` replay is starting. The webview
-   * wipes any previously-displayed history, disables input, and shows a
-   * loading overlay until {@link notifyLoadSessionEnd} fires.
+   * Notify a session's webviews that a `session/load` replay is starting.
+   * The webview wipes any previously-displayed history, disables input, and
+   * shows a loading overlay until {@link notifyLoadSessionEnd} fires.
    */
-  notifyLoadSessionStart(): void {
-    this.postMessage({ type: 'loadSessionStart' });
+  notifyLoadSessionStart(sessionId: string): void {
+    this.postToSession(sessionId, { type: 'loadSessionStart' });
   }
 
-  /** Notify webview that the active replay finished (success or failure). */
-  notifyLoadSessionEnd(ok: boolean): void {
-    this.postMessage({ type: 'loadSessionEnd', ok });
+  /** Notify a session's webviews that the replay finished. */
+  notifyLoadSessionEnd(sessionId: string, ok: boolean): void {
+    this.postToSession(sessionId, { type: 'loadSessionEnd', ok });
   }
 
-  /** Notify webview that session title / metadata changed. */
-  notifySessionInfoUpdate(title: string | undefined | null): void {
-    this.postMessage({ type: 'sessionInfoUpdate', title: title ?? null });
+  /** Notify a session's webviews that its title / metadata changed. */
+  notifySessionInfoUpdate(sessionId: string, title: string | undefined | null): void {
+    this.postToSession(sessionId, { type: 'sessionInfoUpdate', title: title ?? null });
+  }
+
+  // --- Inline permissions ---
+
+  /** Default permission mode from the legacy global setting. */
+  private defaultPermissionMode(): PermissionMode {
+    const autoApprove = vscode.workspace.getConfiguration('acp')
+      .get<string>('autoApprovePermissions', 'none');
+    return autoApprove === 'allowAll' ? 'allowAll' : 'ask';
+  }
+
+  /** Current permission mode for a session. */
+  getPermissionMode(sessionId: string): PermissionMode {
+    return this.permissionModes.get(sessionId) ?? this.defaultPermissionMode();
+  }
+
+  /**
+   * Show a permission request as an inline card in the session's chat.
+   * Resolves with the chosen optionId, or null when no chat surface is
+   * available / the tab closed mid-request (caller falls back to QuickPick).
+   */
+  requestPermissionInChat(params: RequestPermissionRequest): Promise<string | null> {
+    const sessionId = (params as any).sessionId as string | undefined;
+    if (!sessionId || this.webviewsForSession(sessionId).length === 0) {
+      return Promise.resolve(null);
+    }
+    const requestId = `perm-${++this.permissionSeq}-${Date.now()}`;
+    return new Promise<string | null>((resolve) => {
+      this.pendingPermissions.set(requestId, { sessionId, resolve });
+      this.postToSession(sessionId, {
+        type: 'permissionRequest',
+        requestId,
+        title: params.toolCall?.title || 'Permission request',
+        kind: (params.toolCall as any)?.kind || 'other',
+        options: (params.options || []).map(o => ({
+          optionId: o.optionId,
+          name: o.name,
+          kind: o.kind,
+        })),
+      });
+    });
   }
 
   /**
@@ -1334,6 +1468,115 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
+    /* Permission request card — inline in the thread (Claude Code style) */
+    .perm-card {
+      border: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-focusBorder));
+      border-radius: 6px;
+      background: var(--vscode-editorWidget-background);
+      padding: 8px 12px;
+      font-size: 0.9em;
+      margin: 2px 0;
+    }
+    .perm-card .perm-title {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      word-break: break-word;
+    }
+    .perm-card .perm-title .perm-icon { flex-shrink: 0; }
+    .perm-card .perm-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .perm-card .perm-btn {
+      padding: 3px 12px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: var(--vscode-font-family);
+      font-size: 0.95em;
+    }
+    .perm-card .perm-btn.allow {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+    }
+    .perm-card .perm-btn.allow:hover { background: var(--vscode-button-hoverBackground); }
+    .perm-card .perm-btn.allow-session {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+    }
+    .perm-card .perm-btn.allow-session:hover { background: var(--vscode-button-secondaryHoverBackground); }
+    .perm-card .perm-btn.reject {
+      background: transparent;
+      color: var(--vscode-inputValidation-errorForeground, #f48771);
+      border: 1px solid var(--vscode-inputValidation-errorBorder, #be1100);
+    }
+    .perm-card .perm-btn.reject:hover { opacity: 0.85; }
+    .perm-card.resolved { opacity: 0.65; }
+    .perm-card .perm-result {
+      font-size: 0.9em;
+      opacity: 0.8;
+    }
+
+    /* Queued user message (sent while a turn is in flight) */
+    .message.user.queued {
+      opacity: 0.55;
+      border-style: dashed;
+    }
+    .message.user.queued::before {
+      content: 'queued';
+      display: block;
+      font-size: 0.75em;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      opacity: 0.7;
+      margin-bottom: 2px;
+    }
+
+    /* Click-to-copy affordances */
+    .message.assistant.md-rendered code:not(pre code) { cursor: pointer; }
+    .message.assistant.md-rendered code:not(pre code):hover {
+      outline: 1px solid var(--vscode-focusBorder);
+    }
+    .message.assistant.md-rendered pre { position: relative; }
+    .code-copy-btn {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      padding: 1px 7px;
+      font-size: 0.8em;
+      font-family: var(--vscode-font-family);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 3px;
+      background: var(--vscode-editorWidget-background);
+      color: var(--vscode-foreground);
+      cursor: pointer;
+      opacity: 0;
+      transition: opacity 0.15s;
+    }
+    .message.assistant.md-rendered pre:hover .code-copy-btn { opacity: 0.85; }
+    .code-copy-btn:hover { opacity: 1 !important; }
+    .copy-flash {
+      position: fixed;
+      padding: 2px 8px;
+      background: var(--vscode-editorHoverWidget-background);
+      color: var(--vscode-editorHoverWidget-foreground);
+      border: 1px solid var(--vscode-editorHoverWidget-border, var(--vscode-panel-border));
+      border-radius: 4px;
+      font-size: 0.8em;
+      pointer-events: none;
+      z-index: 500;
+      animation: copyFlashFade 0.9s ease-out forwards;
+    }
+    @keyframes copyFlashFade {
+      0% { opacity: 1; transform: translateY(0); }
+      70% { opacity: 1; }
+      100% { opacity: 0; transform: translateY(-6px); }
+    }
+
     /* Full-area overlay shown while a session is being loaded via session/load */
     .load-overlay {
       display: none;
@@ -1413,6 +1656,14 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
         </button>
         <div class="picker-dropdown" id="modelDropdown"></div>
       </div>
+      <div class="picker-wrap" id="permPickerWrap">
+        <button class="picker-btn" id="permPickerBtn" title="Permission mode for this session">
+          <span class="picker-icon">🛡</span>
+          <span class="picker-label" id="permPickerLabel">Ask</span>
+          <span class="picker-chevron">▾</span>
+        </button>
+        <div class="picker-dropdown" id="permDropdown"></div>
+      </div>
       <span class="toolbar-spacer"></span>
       <span class="usage-meter" id="usageMeter" title="Context tokens used"></span>
     </div>
@@ -1473,9 +1724,23 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     const modelPickerLabel = document.getElementById('modelPickerLabel');
     const modelDropdown = document.getElementById('modelDropdown');
     const configOptionsContainer = document.getElementById('configOptionsContainer');
+    const permPickerBtn = document.getElementById('permPickerBtn');
+    const permPickerLabel = document.getElementById('permPickerLabel');
+    const permDropdown = document.getElementById('permDropdown');
 
     let hasActiveSession = false;
     let isProcessing = false;
+
+    // Per-session permission mode (mirrors extension-side state)
+    const PERM_MODES = [
+      { id: 'ask', name: 'Ask every time', desc: 'Every permission request shows a card in the chat.' },
+      { id: 'acceptEdits', name: 'Auto-accept edits', desc: 'File edits are approved automatically; everything else asks.' },
+      { id: 'allowAll', name: 'Allow all (session)', desc: 'Approve every permission request for this session.' },
+    ];
+    let currentPermMode = 'ask';
+
+    // Prompts queued while a turn is in flight — auto-sent on promptEnd.
+    let promptQueue = [];
 
     // Modes / models state (legacy fallback path)
     let availableModes = [];
@@ -1659,24 +1924,53 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
 
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        if (isProcessing) {
-          handleCancel();
-        } else {
-          handleSend();
-        }
+        // While processing, Enter QUEUES the next message (Stop button cancels).
+        handleSend();
       }
     });
 
     function handleSend() {
       const text = promptInput.value.trim();
-      if (!text || isProcessing) return;
+      if (!text) return;
+
+      if (isProcessing) {
+        // Queue it — auto-sends when the current turn finishes.
+        const el = addMessageDOM('user', text);
+        el.classList.add('queued');
+        promptQueue.push({ text, el });
+        promptInput.value = '';
+        return;
+      }
 
       addMessage('user', text);
       promptInput.value = '';
       vscode.postMessage({ type: 'sendPrompt', text });
     }
 
+    function dispatchQueuedPrompt() {
+      if (promptQueue.length === 0) return false;
+      const item = promptQueue.shift();
+      if (item.el) item.el.classList.remove('queued');
+      chatHistory.push({ kind: 'message', role: 'user', text: item.text });
+      saveState();
+      vscode.postMessage({ type: 'sendPrompt', text: item.text });
+      return true;
+    }
+
+    function clearPromptQueue() {
+      if (promptQueue.length === 0) return;
+      // Put the queued text back in the composer so nothing is lost.
+      const texts = promptQueue.map(q => q.text);
+      for (const q of promptQueue) {
+        if (q.el && q.el.isConnected) q.el.remove();
+      }
+      promptQueue = [];
+      const existing = promptInput.value.trim();
+      promptInput.value = (existing ? existing + '\\n' : '') + texts.join('\\n');
+    }
+
     function handleCancel() {
+      clearPromptQueue();
       vscode.postMessage({ type: 'cancelTurn' });
     }
 
@@ -1707,13 +2001,16 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
         sendStopBtn.className = 'send-stop-btn stop';
         sendStopBtn.textContent = '■ Stop';
         sendStopBtn.disabled = false;
-        promptInput.disabled = true;
+        // Composer stays enabled — Enter queues the next message.
+        promptInput.disabled = false;
+        promptInput.placeholder = 'Type to queue the next message…';
         statusEl.innerHTML = '<span class="spinner"></span>';
       } else {
         sendStopBtn.className = 'send-stop-btn send';
         sendStopBtn.textContent = 'Send';
         sendStopBtn.disabled = false;
         promptInput.disabled = false;
+        promptInput.placeholder = savedPlaceholder;
         statusEl.textContent = '';
       }
     }
@@ -1915,6 +2212,180 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    // --- Permission mode picker ---
+    function setPermMode(mode, notify) {
+      const found = PERM_MODES.find(m => m.id === mode);
+      if (!found) return;
+      currentPermMode = found.id;
+      permPickerLabel.textContent = found.name;
+      permPickerBtn.title = found.desc;
+      renderPermDropdown();
+      if (notify) {
+        vscode.postMessage({ type: 'setPermissionMode', mode: found.id });
+      }
+    }
+
+    function renderPermDropdown() {
+      permDropdown.innerHTML = '';
+      for (const m of PERM_MODES) {
+        const item = document.createElement('div');
+        item.className = 'picker-dropdown-item' + (m.id === currentPermMode ? ' selected' : '');
+        item.dataset.desc = m.desc;
+        item.innerHTML =
+          '<span class="check">' + (m.id === currentPermMode ? '✓' : '') + '</span>' +
+          '<span class="item-label">' + escapeHtml(m.name) + '</span>';
+        item.addEventListener('click', (e) => {
+          e.stopPropagation();
+          closePickers();
+          if (m.id !== currentPermMode) setPermMode(m.id, true);
+        });
+        permDropdown.appendChild(item);
+      }
+    }
+
+    permPickerBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const wasOpen = permDropdown.classList.contains('open');
+      closePickers();
+      if (!wasOpen) permDropdown.classList.add('open');
+    });
+    renderPermDropdown();
+
+    // --- Inline permission cards ---
+    const permCards = {};
+
+    function permKindIcon(kind) {
+      switch (kind) {
+        case 'edit': return '✎';
+        case 'execute': return '❯';
+        case 'read': return '👁';
+        case 'delete': return '🗑';
+        case 'fetch': return '🌐';
+        default: return '🛡';
+      }
+    }
+
+    function addPermissionCard(req) {
+      hideEmpty();
+      const el = document.createElement('div');
+      el.className = 'perm-card';
+      el.id = 'perm-' + req.requestId;
+
+      const title = document.createElement('div');
+      title.className = 'perm-title';
+      title.innerHTML = '<span class="perm-icon">' + permKindIcon(req.kind) + '</span>';
+      const titleText = document.createElement('span');
+      titleText.textContent = req.title || 'Permission request';
+      title.appendChild(titleText);
+      el.appendChild(title);
+
+      const actions = document.createElement('div');
+      actions.className = 'perm-actions';
+      for (const opt of (req.options || [])) {
+        const btn = document.createElement('button');
+        btn.className = 'perm-btn ' + (
+          opt.kind === 'allow_once' ? 'allow'
+          : opt.kind === 'allow_always' ? 'allow-session'
+          : 'reject'
+        );
+        btn.textContent = opt.name || opt.optionId;
+        btn.addEventListener('click', () => {
+          vscode.postMessage({
+            type: 'permissionResponse',
+            requestId: req.requestId,
+            optionId: opt.optionId,
+          });
+        });
+        actions.appendChild(btn);
+      }
+      el.appendChild(actions);
+
+      // Render inside the current turn (next to its tool calls) when one
+      // exists, else at the end of the thread.
+      if (currentTurnEl && currentTurnEl.isConnected) {
+        currentTurnEl.appendChild(el);
+      } else {
+        messagesEl.appendChild(el);
+      }
+      permCards[req.requestId] = { el, options: req.options || [] };
+      scrollToBottom();
+    }
+
+    function resolvePermissionCard(requestId, optionId) {
+      const entry = permCards[requestId];
+      if (!entry) return;
+      delete permCards[requestId];
+      const { el, options } = entry;
+      if (!el.isConnected) return;
+      el.classList.add('resolved');
+      const chosen = options.find(o => o.optionId === optionId);
+      const label = chosen
+        ? ((chosen.kind || '').startsWith('allow') ? '✓ ' : '✗ ') + (chosen.name || chosen.optionId)
+        : '✗ Dismissed';
+      const actions = el.querySelector('.perm-actions');
+      if (actions) {
+        const result = document.createElement('div');
+        result.className = 'perm-result';
+        result.textContent = label;
+        actions.replaceWith(result);
+      }
+    }
+
+    // --- Click-to-copy ---
+    function flashCopied(x, y) {
+      const tip = document.createElement('div');
+      tip.className = 'copy-flash';
+      tip.textContent = 'Copied';
+      tip.style.left = Math.max(4, Math.min(x, window.innerWidth - 70)) + 'px';
+      tip.style.top = Math.max(4, y - 26) + 'px';
+      document.body.appendChild(tip);
+      setTimeout(() => tip.remove(), 950);
+    }
+
+    function copyToClipboard(text, x, y) {
+      if (!text) return;
+      const fallback = () => vscode.postMessage({ type: 'copyText', text });
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).catch(fallback);
+        } else {
+          fallback();
+        }
+      } catch (_) {
+        fallback();
+      }
+      flashCopied(x, y);
+    }
+
+    // Inline code spans copy on click (delegated — survives re-renders).
+    messagesEl.addEventListener('click', (e) => {
+      const target = e.target;
+      if (!(target instanceof Element)) return;
+      if (target.closest('.code-copy-btn')) return; // handled below
+      const code = target.closest('code');
+      if (!code || code.closest('pre')) return;
+      if (!code.closest('.md-rendered')) return;
+      copyToClipboard(code.textContent || '', e.clientX, e.clientY);
+    });
+
+    // Fenced code blocks get a hover copy button.
+    function enhanceCodeBlocks(container) {
+      const pres = container.querySelectorAll('pre');
+      for (const pre of pres) {
+        if (pre.querySelector('.code-copy-btn')) continue;
+        const btn = document.createElement('button');
+        btn.className = 'code-copy-btn';
+        btn.textContent = 'Copy';
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const codeEl = pre.querySelector('code');
+          const text = (codeEl ? codeEl.textContent : pre.textContent) || '';
+          copyToClipboard(text, e.clientX, e.clientY);
+        });
+        pre.appendChild(btn);
+      }
+    }
+
     // --- ACP Session Config Options ---
 
     function iconForCategory(cat) {
@@ -2102,6 +2573,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     function closePickers() {
       modeDropdown.classList.remove('open');
       modelDropdown.classList.remove('open');
+      permDropdown.classList.remove('open');
       // Close any dynamic config-option dropdowns
       const open = configOptionsContainer.querySelectorAll('.picker-dropdown.open');
       open.forEach(el => el.classList.remove('open'));
@@ -2183,6 +2655,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     }
     attachScrollHide(modeDropdown);
     attachScrollHide(modelDropdown);
+    attachScrollHide(permDropdown);
     // Dynamic configOption dropdowns: rely on the same handler via event-delegation
     // (they exist inside #configOptionsContainer); attach once per dropdown when created.
     if (configOptionsContainer) {
@@ -2567,6 +3040,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     function showSessionConnected(session) {
       hasActiveSession = true;
       sessionState = {
+        sessionId: session.sessionId,
         agentName: session.agentName,
         cwd: session.cwd,
         title: session.title || undefined,
@@ -2615,16 +3089,65 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       setConfigOptionsState([]);
     }
 
+    /**
+     * Wipe the message thread + per-turn state. Used when this webview
+     * switches to a DIFFERENT session (sidebar follows the active session).
+     */
+    function resetThread() {
+      chatHistory = [];
+      saveState();
+      currentAssistantEl = null;
+      currentAssistantText = '';
+      toolCalls = {};
+      currentTurnEl = null;
+      currentToolsListEl = null;
+      currentToolsCountEl = null;
+      currentToolCount = 0;
+      currentThoughtEl = null;
+      currentThoughtTextEl = null;
+      currentThoughtText = '';
+      thoughtStartTime = null;
+      thoughtEndTime = null;
+      livePlanEl = null;
+      promptQueue = [];
+      messagesEl.innerHTML = '';
+      if (emptyState) {
+        messagesEl.appendChild(emptyState);
+        emptyState.style.display = 'none';
+      }
+      setProcessing(false);
+    }
+
     // Handle messages from the extension
     window.addEventListener('message', (event) => {
       const msg = event.data;
       switch (msg.type) {
         case 'state':
           if (msg.session) {
+            // Switching to a different session? Clear the old thread first.
+            if (sessionState && sessionState.sessionId && msg.session.sessionId
+                && sessionState.sessionId !== msg.session.sessionId) {
+              resetThread();
+            }
             showSessionConnected(msg.session);
+            if (typeof msg.permissionMode === 'string') {
+              setPermMode(msg.permissionMode, false);
+            }
           } else {
             showNoSession();
           }
+          break;
+
+        case 'permissionRequest':
+          addPermissionCard(msg);
+          break;
+
+        case 'permissionResolved':
+          resolvePermissionCard(msg.requestId, msg.optionId);
+          break;
+
+        case 'permissionModeUpdate':
+          setPermMode(msg.mode, false);
           break;
 
         case 'frozen':
@@ -2694,6 +3217,8 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           currentThoughtText = '';
           thoughtStartTime = null;
           thoughtEndTime = null;
+          // Auto-send the next queued prompt, if any.
+          dispatchQueuedPrompt();
           break;
 
         case 'clearChat':
@@ -2778,6 +3303,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
             if (el) {
               el.classList.add('md-rendered');
               el.innerHTML = item.html;
+              enhanceCodeBlocks(el);
             }
           }
           scrollToBottom();
