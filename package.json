@@ -2,7 +2,7 @@
   "name": "acp-client",
   "displayName": "ACP Client (You Wish fork)",
   "description": "Agent Client Protocol client for VS Code \u2014 connect to GitHub Copilot, Claude Code, Gemini CLI, Qwen Code, Codex CLI, OpenCode, OpenClaw, Kiro CLI, Hermes Agent, and any ACP-compatible AI coding agent",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "publisher": "formulahendry",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -157,6 +157,10 @@
         "command": "acp.restartAgent",
         "title": "ACP: Restart Agent",
         "icon": "$(debug-restart)"
+      },
+      {
+        "command": "acp.openChatTab",
+        "title": "ACP: Open Chat as Tab"
       }
     ],
     "menus": {
@@ -388,6 +392,15 @@
           "type": "boolean",
           "default": true,
           "description": "Log all ACP protocol traffic to the output channel."
+        },
+        "acp.preferredLocation": {
+          "type": "string",
+          "enum": [
+            "sidebar",
+            "tab"
+          ],
+          "default": "sidebar",
+          "description": "Where the ACP chat opens: the activity-bar sidebar view, or an editor tab (like a document)."
         }
       }
     }

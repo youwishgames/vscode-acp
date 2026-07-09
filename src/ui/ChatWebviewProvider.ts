@@ -14,6 +14,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'acp-chat';
 
   private view?: vscode.WebviewView;
+  private panel?: vscode.WebviewPanel;
   private updateListener: SessionUpdateListener;
   private _hasChatContent = false;
 
@@ -60,16 +61,49 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     _token: vscode.CancellationToken,
   ): void {
     this.view = webviewView;
+    this.attachWebview(webviewView.webview);
 
-    webviewView.webview.options = {
+    webviewView.onDidDispose(() => {
+      this.view = undefined;
+    });
+  }
+
+  /**
+   * Open (or reveal) the chat as an editor tab hosting the same chat webview.
+   * Both hosts stay live: session updates are broadcast to whichever exist.
+   */
+  openAsTab(): void {
+    if (this.panel) {
+      this.panel.reveal();
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      'acp-chat-tab',
+      'ACP Chat',
+      vscode.ViewColumn.Active,
+      { retainContextWhenHidden: true, enableScripts: true },
+    );
+    panel.iconPath = vscode.Uri.joinPath(this.extensionUri, 'resources', 'icon.svg');
+    this.panel = panel;
+    this.attachWebview(panel.webview);
+    panel.onDidDispose(() => {
+      if (this.panel === panel) this.panel = undefined;
+    });
+  }
+
+  /**
+   * Shared wiring for any webview hosting the chat UI (sidebar view or editor tab).
+   */
+  private attachWebview(webview: vscode.Webview): void {
+    webview.options = {
       enableScripts: true,
       localResourceRoots: [this.extensionUri],
     };
 
-    webviewView.webview.html = this.getHtmlContent(webviewView.webview);
+    webview.html = this.getHtmlContent(webview);
 
     // Handle messages from the webview
-    webviewView.webview.onDidReceiveMessage(async (message) => {
+    webview.onDidReceiveMessage(async (message) => {
       switch (message.type) {
         case 'sendPrompt':
           this._hasChatContent = true;
@@ -118,14 +152,11 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
             index: item.index,
             html: this.renderMarkdown(item.text),
           }));
-          this.postMessage({ type: 'markdownRendered', items: rendered });
+          // Reply only to the webview that asked (indices are host-local).
+          webview.postMessage({ type: 'markdownRendered', items: rendered });
           break;
         }
       }
-    });
-
-    webviewView.onDidDispose(() => {
-      this.view = undefined;
     });
   }
 
@@ -310,6 +341,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
    */
   private postMessage(message: any): void {
     this.view?.webview.postMessage(message);
+    this.panel?.webview.postMessage(message);
   }
 
   /**
@@ -2804,17 +2836,21 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
    * Attach a file URI — notify the webview to include it in the next prompt.
    */
   attachFile(uri: vscode.Uri): void {
-    if (this.view) {
-      this.view.webview.postMessage({
-        type: 'file-attached',
-        path: uri.fsPath,
-        name: uri.fsPath.split(/[\\/]/).pop() || uri.fsPath,
-      });
-      this.view.show?.(true);
+    if (!this.view && !this.panel) return;
+    this.postMessage({
+      type: 'file-attached',
+      path: uri.fsPath,
+      name: uri.fsPath.split(/[\\/]/).pop() || uri.fsPath,
+    });
+    if (this.panel) {
+      this.panel.reveal();
+    } else {
+      this.view?.show?.(true);
     }
   }
 
   dispose(): void {
+    this.panel?.dispose();
     this.sessionUpdateHandler.removeListener(this.updateListener);
   }
 }

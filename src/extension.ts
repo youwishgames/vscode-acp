@@ -57,6 +57,16 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const statusBarManager = new StatusBarManager(sessionManager);
 
+  // Focus the chat wherever the user prefers it (sidebar view or editor tab).
+  const focusChat = () => {
+    const location = vscode.workspace.getConfiguration('acp').get<string>('preferredLocation', 'sidebar');
+    if (location === 'tab') {
+      chatWebviewProvider.openAsTab();
+    } else {
+      vscode.commands.executeCommand('acp-chat.focus');
+    }
+  };
+
   // Notify chat webview when active session changes
   sessionManager.on('active-session-changed', () => {
     chatWebviewProvider.notifyActiveSessionChanged();
@@ -208,12 +218,17 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Open Chat
   const openChatCmd = vscode.commands.registerCommand('acp.openChat', () => {
-    vscode.commands.executeCommand('acp-chat.focus');
+    focusChat();
+  });
+
+  // Open Chat as an editor tab (regardless of acp.preferredLocation)
+  const openChatTabCmd = vscode.commands.registerCommand('acp.openChatTab', () => {
+    chatWebviewProvider.openAsTab();
   });
 
   // Send Prompt (from keybinding — just focus chat)
   const sendPromptCmd = vscode.commands.registerCommand('acp.sendPrompt', async () => {
-    vscode.commands.executeCommand('acp-chat.focus');
+    focusChat();
   });
 
   // Cancel Turn
@@ -327,7 +342,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // No-op if it is already the active session.
     if (sessionManager.getActiveSessionId() === sessionId) {
-      vscode.commands.executeCommand('acp-chat.focus');
+      focusChat();
       return;
     }
 
@@ -342,7 +357,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
 
     try {
-      await vscode.commands.executeCommand('acp-chat.focus');
+      focusChat();
       // Decide load vs resume based on capabilities. Prefer load (replays
       // history) for the richer experience.
       const caps = sessionManager.getCachedCapabilities(agentName);
@@ -502,6 +517,7 @@ export function activate(context: vscode.ExtensionContext): void {
     newConversationCmd,
     disconnectAgentCmd,
     openChatCmd,
+    openChatTabCmd,
     sendPromptCmd,
     cancelTurnCmd,
     restartAgentCmd,
