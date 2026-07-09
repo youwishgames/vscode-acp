@@ -3,7 +3,7 @@ import { marked } from 'marked';
 import { SessionManager } from '../core/SessionManager';
 import { SessionUpdateHandler, SessionUpdateListener } from '../handlers/SessionUpdateHandler';
 import type { SessionNotification } from '@agentclientprotocol/sdk';
-import { logError } from '../utils/Logger';
+import { log, logError } from '../utils/Logger';
 import { sendEvent } from '../utils/TelemetryManager';
 
 /**
@@ -90,6 +90,21 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
         case 'executeCommand':
           if (message.command) {
             await vscode.commands.executeCommand(message.command);
+          }
+          break;
+        case 'openFile':
+          if (message.path) {
+            try {
+              const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(message.path));
+              const editor = await vscode.window.showTextDocument(doc, { preview: true });
+              if (typeof message.line === 'number' && message.line > 0) {
+                const pos = new vscode.Position(message.line - 1, 0);
+                editor.selection = new vscode.Selection(pos, pos);
+                editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.InCenter);
+              }
+            } catch (e) {
+              log(`openFile failed: ${e}`);
+            }
           }
           break;
         case 'ready':
@@ -432,20 +447,25 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     .message {
       padding: 8px 12px;
       border-radius: var(--message-radius);
-      max-width: 95%;
-      line-height: 1.5;
+      max-width: 100%;
+      line-height: 1.55;
       white-space: pre-wrap;
       word-break: break-word;
     }
+    /* User message: full-width bordered block (Claude Code style), not a bubble */
     .message.user {
-      align-self: flex-end;
-      background: var(--vscode-button-background);
-      color: var(--vscode-button-foreground);
-    }
-    .message.assistant {
-      align-self: flex-start;
-      background: var(--vscode-editor-background);
+      align-self: stretch;
+      background: var(--vscode-editorWidget-background);
       border: 1px solid var(--vscode-panel-border);
+      border-radius: 6px;
+      opacity: 0.95;
+    }
+    /* Assistant message: flat text on the panel background — no bubble */
+    .message.assistant {
+      align-self: stretch;
+      background: transparent;
+      border: none;
+      padding: 2px 2px;
     }
     /* Markdown body inside assistant messages */
     .message.assistant.md-rendered {
@@ -622,24 +642,37 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     .turn-tools-list { }
     .turn-tools-list.collapsed { display: none; }
 
-    /* Compact inline tool call */
+    /* Compact inline tool call — expandable card */
     .tool-call-inline {
+      border-radius: 5px;
+      background: var(--vscode-editorWidget-background);
+      border: 1px solid var(--vscode-panel-border);
+      font-size: 0.85em;
+      overflow: hidden;
+    }
+    .tool-call-inline .tc-header {
       display: flex;
       align-items: center;
       gap: 6px;
-      padding: 3px 6px;
-      font-size: 0.85em;
-      border-radius: 4px;
-      background: var(--vscode-editorWidget-background);
-      opacity: 0.85;
+      padding: 4px 8px;
+      cursor: default;
+      user-select: none;
     }
+    .tool-call-inline.has-body .tc-header { cursor: pointer; }
+    .tool-call-inline.has-body .tc-header:hover { background: var(--vscode-list-hoverBackground); }
     .tool-call-inline .tc-icon {
       flex-shrink: 0;
       width: 14px;
       text-align: center;
     }
     .tool-call-inline .tc-icon.pending { color: var(--vscode-badge-foreground); }
-    .tool-call-inline .tc-icon.running { color: var(--vscode-progressBar-background); }
+    .tool-call-inline .tc-icon.running,
+    .tool-call-inline .tc-icon.in_progress {
+      color: var(--vscode-progressBar-background);
+      display: inline-block;
+      animation: tcSpin 1.2s linear infinite;
+    }
+    @keyframes tcSpin { to { transform: rotate(360deg); } }
     .tool-call-inline .tc-icon.completed { color: var(--vscode-testing-iconPassed); }
     .tool-call-inline .tc-icon.failed { color: var(--vscode-testing-iconFailed); }
     .tool-call-inline .tc-title {
@@ -647,6 +680,68 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      font-family: var(--vscode-editor-font-family);
+    }
+    .tool-call-inline .tc-caret {
+      flex-shrink: 0;
+      opacity: 0.5;
+      font-size: 0.9em;
+      display: none;
+    }
+    .tool-call-inline.has-body .tc-caret { display: inline; }
+    .tool-call-inline .tc-open-file {
+      flex-shrink: 0;
+      opacity: 0.55;
+      cursor: pointer;
+      padding: 0 2px;
+    }
+    .tool-call-inline .tc-open-file:hover { opacity: 1; }
+    .tool-call-inline .tc-body {
+      display: none;
+      border-top: 1px solid var(--vscode-panel-border);
+      max-height: 320px;
+      overflow: auto;
+      background: var(--vscode-editor-background);
+    }
+    .tool-call-inline.expanded .tc-body { display: block; }
+    .tool-call-inline .tc-output {
+      margin: 0;
+      padding: 6px 8px;
+      font-family: var(--vscode-editor-font-family);
+      font-size: 0.95em;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    /* Diff rendering (file edits) */
+    .diff-block {
+      font-family: var(--vscode-editor-font-family);
+      font-size: 0.95em;
+      line-height: 1.45;
+    }
+    .diff-block .diff-file {
+      padding: 3px 8px;
+      font-size: 0.9em;
+      opacity: 0.7;
+      border-bottom: 1px solid var(--vscode-panel-border);
+    }
+    .diff-block .diff-line {
+      padding: 0 8px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .diff-block .diff-line.add {
+      background: var(--vscode-diffEditor-insertedTextBackground, rgba(46, 160, 67, 0.2));
+    }
+    .diff-block .diff-line.del {
+      background: var(--vscode-diffEditor-removedTextBackground, rgba(248, 81, 73, 0.2));
+    }
+    .diff-block .diff-line.ctx { opacity: 0.65; }
+    .diff-block .diff-gap {
+      padding: 0 8px;
+      opacity: 0.4;
+      user-select: none;
     }
 
     /* Legacy standalone tool-call card (for history restore) */
@@ -673,21 +768,46 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     .tool-call .status-badge.completed { background: var(--vscode-testing-iconPassed); color: white; }
     .tool-call .status-badge.failed { background: var(--vscode-testing-iconFailed); color: white; }
 
-    /* Plan */
+    /* Plan — live task checklist */
     .plan {
       padding: 8px 12px;
-      border-radius: var(--message-radius);
+      border-radius: 6px;
       background: var(--vscode-editorWidget-background);
       border: 1px solid var(--vscode-panel-border);
+      font-size: 0.9em;
     }
-    .plan .plan-title { font-weight: 600; margin-bottom: 6px; }
+    .plan .plan-title {
+      font-weight: 600;
+      margin-bottom: 6px;
+      font-size: 0.9em;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      opacity: 0.7;
+    }
     .plan .plan-entry {
       padding: 2px 0;
       display: flex;
-      align-items: center;
-      gap: 6px;
+      align-items: baseline;
+      gap: 7px;
     }
-    .plan .plan-entry.completed { text-decoration: line-through; opacity: 0.6; }
+    .plan .plan-entry .plan-box { flex-shrink: 0; }
+    .plan .plan-entry.completed { opacity: 0.55; }
+    .plan .plan-entry.completed .plan-text { text-decoration: line-through; }
+    .plan .plan-entry.in_progress .plan-text { font-weight: 600; }
+    .plan .plan-entry.in_progress .plan-box { color: var(--vscode-progressBar-background); }
+    .plan .plan-entry.completed .plan-box { color: var(--vscode-testing-iconPassed); }
+
+    /* Usage meter (composer corner) */
+    .usage-meter {
+      margin-left: auto;
+      font-size: 0.78em;
+      opacity: 0;
+      transition: opacity 0.3s;
+      white-space: nowrap;
+      align-self: center;
+      font-family: var(--vscode-editor-font-family);
+    }
+    .usage-meter.visible { opacity: 0.6; }
 
     /* Empty / welcome state */
     .empty-state {
@@ -1172,6 +1292,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
         <div class="picker-dropdown" id="modelDropdown"></div>
       </div>
       <span class="toolbar-spacer"></span>
+      <span class="usage-meter" id="usageMeter" title="Context tokens used"></span>
     </div>
     <div class="input-editor-wrap">
       <textarea
@@ -1965,7 +2086,8 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
 
     function getStatusIcon(status) {
       switch (status) {
-        case 'running': return '⟳';
+        case 'running':
+        case 'in_progress': return '⟳';
         case 'completed': return '✓';
         case 'failed': return '✗';
         default: return '…';
@@ -2008,13 +2130,112 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    function addToolCall(toolCallId, title, status) {
+    function addToolCall(toolCallId, title, status, content, locations) {
       chatHistory.push({ kind: 'toolCall', toolCallId, title, status });
       saveState();
-      addToolCallInline(toolCallId, title, status);
+      addToolCallInline(toolCallId, title, status, content, locations);
     }
 
-    function addToolCallInline(toolCallId, title, status) {
+    // Simple line diff (LCS) for FileEditToolCallContent rendering.
+    function computeLineDiff(oldText, newText) {
+      const a = (oldText || '').split('\n');
+      const b = (newText || '').split('\n');
+      const m = a.length, n = b.length;
+      // Cap quadratic work on huge files: fall back to plain replace view.
+      if (m * n > 2000000) {
+        return a.map(l => ({ t: 'del', s: l })).concat(b.map(l => ({ t: 'add', s: l })));
+      }
+      const dp = Array.from({ length: m + 1 }, () => new Uint32Array(n + 1));
+      for (let i = m - 1; i >= 0; i--) {
+        for (let j = n - 1; j >= 0; j--) {
+          dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+        }
+      }
+      const out = [];
+      let i = 0, j = 0;
+      while (i < m && j < n) {
+        if (a[i] === b[j]) { out.push({ t: 'ctx', s: a[i] }); i++; j++; }
+        else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push({ t: 'del', s: a[i] }); i++; }
+        else { out.push({ t: 'add', s: b[j] }); j++; }
+      }
+      while (i < m) { out.push({ t: 'del', s: a[i++] }); }
+      while (j < n) { out.push({ t: 'add', s: b[j++] }); }
+      return out;
+    }
+
+    // Render a diff with 2 context lines around changes, gaps collapsed.
+    function renderDiffHtml(path, oldText, newText) {
+      const lines = computeLineDiff(oldText, newText);
+      const keep = new Array(lines.length).fill(false);
+      const CTX = 2;
+      for (let k = 0; k < lines.length; k++) {
+        if (lines[k].t !== 'ctx') {
+          for (let d = Math.max(0, k - CTX); d <= Math.min(lines.length - 1, k + CTX); d++) keep[d] = true;
+        }
+      }
+      const fileName = (path || '').split('/').pop() || path || '';
+      let html = '<div class="diff-block"><div class="diff-file">' + escapeHtml(fileName) + '</div>';
+      let inGap = false;
+      for (let k = 0; k < lines.length; k++) {
+        if (!keep[k]) {
+          if (!inGap) { html += '<div class="diff-gap">⋯</div>'; inGap = true; }
+          continue;
+        }
+        inGap = false;
+        const l = lines[k];
+        const prefix = l.t === 'add' ? '+ ' : l.t === 'del' ? '- ' : '  ';
+        html += '<div class="diff-line ' + l.t + '">' + escapeHtml(prefix + l.s) + '</div>';
+      }
+      html += '</div>';
+      return html;
+    }
+
+    // Build the expandable body for a tool row from ACP content blocks.
+    function buildToolBody(el, content) {
+      if (!content || !content.length) return;
+      let body = el.querySelector('.tc-body');
+      if (!body) {
+        body = document.createElement('div');
+        body.className = 'tc-body';
+        el.appendChild(body);
+      }
+      let html = '';
+      let hasDiff = false;
+      for (const block of content) {
+        if (block && block.type === 'diff') {
+          html += renderDiffHtml(block.path, block.oldText, block.newText);
+          hasDiff = true;
+        } else if (block && block.type === 'content' && block.content && block.content.type === 'text') {
+          const text = block.content.text || '';
+          if (text.trim()) {
+            html += '<pre class="tc-output">' + escapeHtml(text.length > 20000 ? text.slice(0, 20000) + '\n…' : text) + '</pre>';
+          }
+        }
+      }
+      if (!html) { body.remove(); return; }
+      body.innerHTML = html;
+      el.classList.add('has-body');
+      // Diffs auto-expand (like Claude Code); plain output stays collapsed.
+      if (hasDiff) el.classList.add('expanded');
+    }
+
+    function attachToolLocation(el, locations) {
+      if (!locations || !locations.length || el.querySelector('.tc-open-file')) return;
+      const loc = locations[0];
+      if (!loc || !loc.path) return;
+      const btn = document.createElement('span');
+      btn.className = 'tc-open-file';
+      btn.title = 'Open ' + loc.path;
+      btn.textContent = '↗';
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        vscode.postMessage({ type: 'openFile', path: loc.path, line: loc.line || 0 });
+      });
+      const header = el.querySelector('.tc-header');
+      if (header) header.appendChild(btn);
+    }
+
+    function addToolCallInline(toolCallId, title, status, content, locations) {
       hideEmpty();
       ensureTurnTools();
       currentToolCount++;
@@ -2026,9 +2247,21 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       const el = document.createElement('div');
       el.className = 'tool-call-inline';
       el.id = 'tc-' + toolCallId;
-      el.innerHTML =
+      const header = document.createElement('div');
+      header.className = 'tc-header';
+      header.innerHTML =
         '<span class="tc-icon ' + status + '">' + getStatusIcon(status) + '</span>' +
-        '<span class="tc-title">' + escapeHtml(title || 'Tool Call') + '</span>';
+        '<span class="tc-title">' + escapeHtml(title || 'Tool Call') + '</span>' +
+        '<span class="tc-caret">▸</span>';
+      header.addEventListener('click', () => {
+        if (!el.classList.contains('has-body')) return;
+        const open = el.classList.toggle('expanded');
+        const caret = header.querySelector('.tc-caret');
+        if (caret) caret.textContent = open ? '▾' : '▸';
+      });
+      el.appendChild(header);
+      if (content) buildToolBody(el, content);
+      if (locations) attachToolLocation(el, locations);
       currentToolsListEl.appendChild(el);
       toolCalls[toolCallId] = el;
       scrollToBottom();
@@ -2047,7 +2280,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       scrollToBottom();
     }
 
-    function updateToolCall(toolCallId, status, title) {
+    function updateToolCall(toolCallId, status, title, content, locations) {
       for (let i = chatHistory.length - 1; i >= 0; i--) {
         if (chatHistory[i].kind === 'toolCall' && chatHistory[i].toolCallId === toolCallId) {
           chatHistory[i].status = status;
@@ -2069,6 +2302,8 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           const titleEl = el.querySelector('.tc-title');
           if (titleEl) titleEl.textContent = title;
         }
+        if (content) buildToolBody(el, content);
+        if (locations) attachToolLocation(el, locations);
         return;
       }
       // Legacy card style fallback
@@ -2083,29 +2318,49 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    let livePlanEl = null;
+
     function addPlan(plan) {
-      chatHistory.push({ kind: 'plan', plan: plan });
+      // Live checklist: replace the previous plan snapshot in history
+      // instead of stacking a card per update.
+      const last = chatHistory[chatHistory.length - 1];
+      if (last && last.kind === 'plan') {
+        last.plan = plan;
+      } else {
+        chatHistory.push({ kind: 'plan', plan: plan });
+      }
       saveState();
       addPlanDOM(plan);
     }
 
-    function addPlanDOM(plan) {
-      hideEmpty();
-      const el = document.createElement('div');
-      el.className = 'plan';
-      let html = '<div class="plan-title">Plan</div>';
+    function planEntriesHtml(plan) {
+      let html = '<div class="plan-title">Tasks</div>';
       if (plan.entries) {
         for (const entry of plan.entries) {
-          const icon = entry.status === 'completed' ? '✅'
-            : entry.status === 'in_progress' ? '🔄' : '⬜';
-          const cls = entry.status === 'completed' ? ' completed' : '';
-          html += '<div class="plan-entry' + cls + '">'
-            + icon + ' ' + escapeHtml(entry.title || entry.description || entry.content || '')
+          const status = entry.status || 'pending';
+          const box = status === 'completed' ? '☑' : status === 'in_progress' ? '◉' : '☐';
+          html += '<div class="plan-entry ' + status + '">'
+            + '<span class="plan-box">' + box + '</span>'
+            + '<span class="plan-text">' + escapeHtml(entry.title || entry.description || entry.content || '') + '</span>'
             + '</div>';
         }
       }
-      el.innerHTML = html;
+      return html;
+    }
+
+    function addPlanDOM(plan) {
+      hideEmpty();
+      // Update the existing card in place while it's the live one.
+      if (livePlanEl && livePlanEl.isConnected) {
+        livePlanEl.innerHTML = planEntriesHtml(plan);
+        scrollToBottom();
+        return;
+      }
+      const el = document.createElement('div');
+      el.className = 'plan';
+      el.innerHTML = planEntriesHtml(plan);
       messagesEl.appendChild(el);
+      livePlanEl = el;
       scrollToBottom();
     }
 
@@ -2478,6 +2733,8 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
             tc.toolCallId || 'unknown',
             tc.title || 'Tool Call',
             tc.status || 'pending',
+            tc.content,
+            tc.locations,
           );
           break;
         }
@@ -2487,12 +2744,25 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
             update.toolCallId || 'unknown',
             update.status || 'completed',
             update.title,
+            update.content,
+            update.locations,
           );
           break;
         }
 
         case 'plan': {
           addPlan(update);
+          break;
+        }
+
+        case 'usage_update': {
+          const meter = document.getElementById('usageMeter');
+          if (meter && typeof update.used === 'number' && update.used > 0) {
+            const fmt = (n) => n >= 1000000 ? (n / 1000000).toFixed(1) + 'M'
+              : n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+            meter.textContent = fmt(update.used) + (update.size ? ' / ' + fmt(update.size) : '') + ' tokens';
+            meter.classList.add('visible');
+          }
           break;
         }
 
