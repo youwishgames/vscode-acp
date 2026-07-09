@@ -163,6 +163,10 @@ export function activate(context: vscode.ExtensionContext): void {
           await sessionManager.connectToAgent(agentName!);
         },
       );
+      // Surface the chat where the user prefers it. The sidebar flow used to
+      // rely on the chat view already being visible; in tab mode nothing
+      // would open at all.
+      focusChat();
     } catch (e: any) {
       logError('Failed to connect to agent', e);
       vscode.window.showErrorMessage(`Failed to connect: ${e.message}`);
@@ -199,6 +203,7 @@ export function activate(context: vscode.ExtensionContext): void {
           await sessionManager.newConversation();
         },
       );
+      focusChat();
     } catch (e: any) {
       logError('Failed to start new conversation', e);
       vscode.window.showErrorMessage(`Failed to start new conversation: ${e.message}`);
