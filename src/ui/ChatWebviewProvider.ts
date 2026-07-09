@@ -3321,10 +3321,14 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
               break;
             }
             if (!currentAssistantEl) {
-              // Chronological layout: text after a thought/tools run starts
-              // a NEW segment appended below them.
-              finalizeThoughtSegment();
+              // Chronological layout: text after a tools run starts a NEW
+              // segment below it. The thought block is NOT closed — engines
+              // interleave thinking and content deltas token-by-token, and
+              // closing the text segment per thought chunk shreds prose
+              // into micro-paragraphs. Both streams stay open side by side
+              // (thought above, text below) until a tool call or turn end.
               closeToolsBlock();
+              if (currentThoughtEl) currentThoughtEl.open = false;
               if (!currentTurnEl) {
                 currentTurnEl = document.createElement('div');
                 currentTurnEl.className = 'turn';
@@ -3367,9 +3371,9 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           const content = update.content;
           if (content && content.type === 'text') {
             if (!currentThoughtEl) {
-              // Chronological layout: a thought after text/tools starts a
-              // NEW block appended below them.
-              finalizeTextSegment();
+              // One thought block per tool-call-free stretch. Do NOT close
+              // the open text segment — interleaved thought deltas must not
+              // shred the content stream (see agent_message_chunk).
               closeToolsBlock();
               if (!currentTurnEl) {
                 currentTurnEl = document.createElement('div');
