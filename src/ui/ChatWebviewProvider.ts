@@ -538,6 +538,22 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       opacity: 0.7;
       flex-shrink: 0;
     }
+    .session-banner .banner-btn {
+      flex-shrink: 0;
+      margin-left: 8px;
+      padding: 3px 10px;
+      font-size: 0.85em;
+      font-family: var(--vscode-font-family);
+      color: var(--vscode-button-foreground);
+      background: var(--vscode-button-background);
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .session-banner .banner-btn:hover {
+      background: var(--vscode-button-hoverBackground);
+    }
 
     /* Messages area */
     .messages {
@@ -1352,6 +1368,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       <div class="cwd" id="bannerCwd"></div>
     </div>
     <span class="status" id="status"></span>
+    <button class="banner-btn" id="newChatBtn" title="Start a new chat in a new tab">＋ New chat</button>
   </div>
 
   <div class="messages" id="messages">
@@ -1680,6 +1697,8 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     const welcomeAddAgent = document.getElementById('welcomeAddAgent');
     if (welcomeConnectAgent) welcomeConnectAgent.addEventListener('click', () => execCmd('acp.connectAgent'));
     if (welcomeAddAgent) welcomeAddAgent.addEventListener('click', () => execCmd('acp.addAgent'));
+    const newChatBtn = document.getElementById('newChatBtn');
+    if (newChatBtn) newChatBtn.addEventListener('click', () => execCmd('acp.newChatTab'));
 
     // --- Send/Stop toggle ---
     function setProcessing(processing) {
