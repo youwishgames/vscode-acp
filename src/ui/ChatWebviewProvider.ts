@@ -17,6 +17,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   // Chat tabs -> the session id each is bound to (null = adopts the next
   // active session). The sidebar view always follows the active session.
   private panels = new Map<vscode.WebviewPanel, string | null>();
+  private readyWatchdogs = new Map<vscode.Webview, ReturnType<typeof setTimeout>>();
   private updateListener: SessionUpdateListener;
   private _hasChatContent = false;
 
@@ -100,14 +101,28 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
       'acp-chat-tab',
       'ACP Chat',
       vscode.ViewColumn.Active,
-      { retainContextWhenHidden: true, enableScripts: true },
+      {
+        retainContextWhenHidden: true,
+        enableScripts: true,
+        localResourceRoots: [this.extensionUri],
+      },
     );
     panel.iconPath = vscode.Uri.joinPath(this.extensionUri, 'resources', 'icon.svg');
     this.panels.set(panel, bound);
-    this.attachWebview(panel.webview);
+    // Wire messages + html directly — do NOT reassign webview.options after
+    // creation (resetting options on a panel can reload/neuter the content).
+    this.attachWebview(panel.webview, { skipOptions: true });
+    panel.onDidChangeViewState(() => {
+      log(`chat tab view state: visible=${panel.visible} active=${panel.active}`);
+    });
     panel.onDidDispose(() => {
       this.panels.delete(panel);
     });
+    // Watchdog: if the page's script never reports in, say so loudly.
+    const watchdog = setTimeout(() => {
+      log('WARNING: chat tab webview never sent ready within 3s — script did not run');
+    }, 3000);
+    this.readyWatchdogs.set(panel.webview, watchdog);
   }
 
   /** Webviews that should receive active-session traffic. */
@@ -124,11 +139,13 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
   /**
    * Shared wiring for any webview hosting the chat UI (sidebar view or editor tab).
    */
-  private attachWebview(webview: vscode.Webview): void {
-    webview.options = {
-      enableScripts: true,
-      localResourceRoots: [this.extensionUri],
-    };
+  private attachWebview(webview: vscode.Webview, opts?: { skipOptions?: boolean }): void {
+    if (!opts?.skipOptions) {
+      webview.options = {
+        enableScripts: true,
+        localResourceRoots: [this.extensionUri],
+      };
+    }
 
     webview.html = this.getHtmlContent(webview);
 
@@ -173,11 +190,17 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
             }
           }
           break;
-        case 'ready':
+        case 'ready': {
           // Webview loaded — send current session state (host-local)
           log('webview ready (host attached)');
+          const watchdog = this.readyWatchdogs.get(webview);
+          if (watchdog) {
+            clearTimeout(watchdog);
+            this.readyWatchdogs.delete(webview);
+          }
           this.sendCurrentState(webview);
           break;
+        }
         case 'clientError':
           log(`WEBVIEW ERROR: ${message.message} (line ${message.line}) ${message.stack || ''}`);
           break;
