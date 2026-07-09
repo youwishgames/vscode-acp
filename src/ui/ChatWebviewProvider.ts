@@ -2255,8 +2255,8 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
 
     // Simple line diff (LCS) for FileEditToolCallContent rendering.
     function computeLineDiff(oldText, newText) {
-      const a = (oldText || '').split('\n');
-      const b = (newText || '').split('\n');
+      const a = (oldText || '').split('\\n');
+      const b = (newText || '').split('\\n');
       const m = a.length, n = b.length;
       // Cap quadratic work on huge files: fall back to plain replace view.
       if (m * n > 2000000) {
@@ -2325,7 +2325,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
         } else if (block && block.type === 'content' && block.content && block.content.type === 'text') {
           const text = block.content.text || '';
           if (text.trim()) {
-            html += '<pre class="tc-output">' + escapeHtml(text.length > 20000 ? text.slice(0, 20000) + '\n…' : text) + '</pre>';
+            html += '<pre class="tc-output">' + escapeHtml(text.length > 20000 ? text.slice(0, 20000) + '\\n…' : text) + '</pre>';
           }
         }
       }
