@@ -39,9 +39,11 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     private readonly sessionManager: SessionManager,
     private readonly sessionUpdateHandler: SessionUpdateHandler,
   ) {
-    // Configure marked for safe rendering
+    // Configure marked for safe rendering. breaks:false — engines like GLM
+    // soft-wrap prose with single newlines; CommonMark semantics join them
+    // (blank lines still separate paragraphs).
     marked.setOptions({
-      breaks: true,
+      breaks: false,
       gfm: true,
     });
 
@@ -2994,36 +2996,70 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     /**
-     * Commit the in-progress assistant turn to chatHistory (without firing
-     * the live promptEnd markdown-render request — replay does that
-     * batched at loadSessionEnd). Resets all per-turn DOM/state pointers so
-     * the next turn starts fresh.
+     * Close the OPEN text segment: commit it to chatHistory and (outside
+     * replay) request its markdown render immediately. Segments are
+     * chronological — text between tool calls each become their own
+     * rendered block, interleaved with the tool rows.
      */
-    function finalizeCurrentAssistantTurn() {
+    function finalizeTextSegment() {
+      if (currentAssistantText) {
+        chatHistory.push({ kind: 'message', role: 'assistant', text: currentAssistantText });
+        saveState();
+        if (currentAssistantEl && !isLoadingSession) {
+          vscode.postMessage({
+            type: 'renderMarkdown',
+            items: [{ index: chatHistory.length - 1, text: currentAssistantText }],
+          });
+        }
+      }
+      currentAssistantEl = null;
+      currentAssistantText = '';
+    }
+
+    /** Close the OPEN tools block (collapse it when it got long). */
+    function closeToolsBlock() {
+      if (currentToolsListEl && currentToolCount > 3) {
+        currentToolsListEl.classList.add('collapsed');
+        if (currentToolsCountEl) {
+          currentToolsCountEl.dataset.count = String(currentToolCount);
+          currentToolsCountEl.textContent = '▸ ' + currentToolCount + ' tool call' + (currentToolCount !== 1 ? 's' : '');
+        }
+      }
+      currentToolsListEl = null;
+      currentToolsCountEl = null;
+      currentToolCount = 0;
+    }
+
+    /** Close the OPEN thought block and commit it to chatHistory. */
+    function finalizeThoughtSegment() {
+      if (!currentThoughtEl) return;
+      finalizeThought();
+      currentThoughtEl.open = false;
       if (currentThoughtText) {
-        finalizeThought();
         const tEnd = thoughtEndTime || Date.now();
         chatHistory.push({
           kind: 'thought',
           text: currentThoughtText,
           durationSec: thoughtStartTime ? Math.round((tEnd - thoughtStartTime) / 1000) : 0,
         });
-      }
-      if (currentAssistantText) {
-        chatHistory.push({ kind: 'message', role: 'assistant', text: currentAssistantText });
         saveState();
       }
-      currentAssistantEl = null;
-      currentAssistantText = '';
-      currentTurnEl = null;
-      currentToolsListEl = null;
-      currentToolsCountEl = null;
-      currentToolCount = 0;
       currentThoughtEl = null;
       currentThoughtTextEl = null;
       currentThoughtText = '';
       thoughtStartTime = null;
       thoughtEndTime = null;
+    }
+
+    /**
+     * Commit everything still open in the in-progress turn and reset the
+     * per-turn pointers so the next turn starts fresh.
+     */
+    function finalizeCurrentAssistantTurn() {
+      finalizeThoughtSegment();
+      finalizeTextSegment();
+      closeToolsBlock();
+      currentTurnEl = null;
     }
 
     function addThoughtDOM(text, durationSec) {
@@ -3161,62 +3197,15 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           break;
 
         case 'promptStart':
+          // Commit anything still open (no-op on a clean boundary) so the
+          // new turn starts fresh without losing prior segments.
+          finalizeCurrentAssistantTurn();
           setProcessing(true);
-          currentAssistantEl = null;
-          currentAssistantText = '';
-          currentTurnEl = null;
-          currentToolsListEl = null;
-          currentToolsCountEl = null;
-          currentToolCount = 0;
-          currentThoughtEl = null;
-          currentThoughtTextEl = null;
-          currentThoughtText = '';
-          thoughtStartTime = null;
-          thoughtEndTime = null;
           break;
 
         case 'promptEnd':
-          // Finalize thought block if present
-          if (currentThoughtText) {
-            finalizeThought();
-            const tEnd = thoughtEndTime || Date.now();
-            chatHistory.push({
-              kind: 'thought',
-              text: currentThoughtText,
-              durationSec: thoughtStartTime ? Math.round((tEnd - thoughtStartTime) / 1000) : 0,
-            });
-          }
-          if (currentAssistantText) {
-            chatHistory.push({ kind: 'message', role: 'assistant', text: currentAssistantText });
-            saveState();
-            // Request markdown rendering from extension host
-            if (currentAssistantEl) {
-              vscode.postMessage({
-                type: 'renderMarkdown',
-                items: [{ index: chatHistory.length - 1, text: currentAssistantText }]
-              });
-            }
-          }
+          finalizeCurrentAssistantTurn();
           setProcessing(false);
-          currentAssistantEl = null;
-          currentAssistantText = '';
-          // Auto-collapse tool calls in completed turns
-          if (currentToolsListEl && currentToolCount > 3) {
-            currentToolsListEl.classList.add('collapsed');
-            if (currentToolsCountEl) {
-              currentToolsCountEl.dataset.count = String(currentToolCount);
-              currentToolsCountEl.textContent = '▸ ' + currentToolCount + ' tool calls';
-            }
-          }
-          currentTurnEl = null;
-          currentToolsListEl = null;
-          currentToolsCountEl = null;
-          currentToolCount = 0;
-          currentThoughtEl = null;
-          currentThoughtTextEl = null;
-          currentThoughtText = '';
-          thoughtStartTime = null;
-          thoughtEndTime = null;
           // Auto-send the next queued prompt, if any.
           dispatchQueuedPrompt();
           break;
@@ -3325,13 +3314,11 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
             if (!currentAssistantEl && !currentAssistantText.trim()) {
               break;
             }
-            // Auto-collapse thought when assistant text starts
-            if (currentThoughtEl && currentThoughtEl.open) {
-              finalizeThought();
-              currentThoughtEl.open = false;
-            }
             if (!currentAssistantEl) {
-              // Create a turn container, assistant text goes inside it
+              // Chronological layout: text after a thought/tools run starts
+              // a NEW segment appended below them.
+              finalizeThoughtSegment();
+              closeToolsBlock();
               if (!currentTurnEl) {
                 currentTurnEl = document.createElement('div');
                 currentTurnEl.className = 'turn';
@@ -3340,7 +3327,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
               }
               currentAssistantEl = document.createElement('div');
               currentAssistantEl.className = 'message assistant';
-              currentTurnEl.insertBefore(currentAssistantEl, currentTurnEl.querySelector('.turn-tools'));
+              currentTurnEl.appendChild(currentAssistantEl);
             }
             currentAssistantEl.textContent = currentAssistantText;
             scrollToBottom();
@@ -3374,7 +3361,10 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
           const content = update.content;
           if (content && content.type === 'text') {
             if (!currentThoughtEl) {
-              // Create thought block inside turn
+              // Chronological layout: a thought after text/tools starts a
+              // NEW block appended below them.
+              finalizeTextSegment();
+              closeToolsBlock();
               if (!currentTurnEl) {
                 currentTurnEl = document.createElement('div');
                 currentTurnEl.className = 'turn';
@@ -3388,7 +3378,7 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
                 '<summary><span class="thought-indicator"></span> Thinking\u2026</summary>' +
                 '<div class="thought-content"></div>';
               currentThoughtTextEl = currentThoughtEl.querySelector('.thought-content');
-              currentTurnEl.insertBefore(currentThoughtEl, currentTurnEl.firstChild);
+              currentTurnEl.appendChild(currentThoughtEl);
               thoughtStartTime = Date.now();
               currentThoughtText = '';
             }
@@ -3400,6 +3390,10 @@ export class ChatWebviewProvider implements vscode.WebviewViewProvider {
         }
 
         case 'tool_call': {
+          // Chronological layout: a tool call closes the open thought/text
+          // segment; consecutive tool calls share one tools block.
+          finalizeThoughtSegment();
+          finalizeTextSegment();
           const tc = update;
           addToolCall(
             tc.toolCallId || 'unknown',
